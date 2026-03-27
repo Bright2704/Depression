@@ -1,0 +1,12 @@
+{
+  "task": "regression",
+  "label_col": "phq9_score",
+  "feature_count": 67,
+  "train_size": 160,
+  "test_size": 40,
+  "metrics": {
+    "mae": 1.6549736121175087,
+    "rmse": 2.081492899994836,
+    "r2": 0.2161713807817437
+  }
+}

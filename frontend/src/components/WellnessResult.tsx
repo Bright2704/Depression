@@ -9,9 +9,14 @@
 
 'use client';
 
-import React, { useState, useMemo } from 'react';
-import type { PHQ9Prediction } from '@/lib/phq9-predictor';
+import React, { useState, useMemo, useEffect } from 'react';
+import Link from 'next/link';
+import type { PHQ9Prediction, WindowStatistics } from '@/lib/phq9-predictor';
+import type { ScanDebugData } from '@/components/FaceScan';
 import type { CheckinResponse } from './QuickCheckin';
+import type { PHQ9Response } from '@/components/PHQ9Survey';
+import { useAuthStore } from '@/stores/auth-store';
+import { authClient } from '@/lib/auth-client';
 
 // ============================================================================
 // Types
@@ -60,13 +65,30 @@ interface DetailedAnalysis {
   suggestion: string;
 }
 
+function formatPHQ9Severity(severity: PHQ9Response['severity']): string {
+  switch (severity) {
+    case 'minimal':
+      return 'น้อยมาก';
+    case 'mild':
+      return 'เล็กน้อย';
+    case 'moderate':
+      return 'ปานกลาง';
+    case 'moderately_severe':
+      return 'ค่อนข้างมาก';
+    case 'severe':
+      return 'รุนแรง';
+    default:
+      return '-';
+  }
+}
+
 interface Props {
   prediction: PHQ9Prediction;
   checkinResponse?: CheckinResponse;
+  phq9Response?: PHQ9Response;
   onReset: () => void;
-  onSaveHistory?: () => void;
-  onDownloadPDF?: () => void;
   scanTimestamp?: number;
+  debugData?: ScanDebugData;
 }
 
 // ============================================================================
@@ -504,47 +526,93 @@ function getRiskLabel(risk: MentalHealthRisk['risk']) {
 }
 
 // ============================================================================
+// Raw Summary Functions
+// ============================================================================
+
+function summarizeWindowStats(windowStats: WindowStatistics[]) {
+  if (!windowStats.length) return null;
+
+  const mean = (arr: number[]) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  const auKeys = ['AU01', 'AU02', 'AU04', 'AU06', 'AU07', 'AU10', 'AU12', 'AU14', 'AU15', 'AU17', 'AU23', 'AU24'];
+
+  const actionUnits = Object.fromEntries(
+    auKeys.map(key => [
+      key,
+      {
+        mean: mean(windowStats.map(w => w.actionUnits[key]?.mean || 0)),
+        std: mean(windowStats.map(w => w.actionUnits[key]?.std || 0)),
+      },
+    ])
+  ) as Record<string, { mean: number; std: number }>;
+
+  const headMovement = mean([
+    mean(windowStats.map(w => w.headPose.pitch.range)),
+    mean(windowStats.map(w => w.headPose.yaw.range)),
+    mean(windowStats.map(w => w.headPose.roll.range)),
+  ]);
+
+  const expressionVariability = mean(Object.values(actionUnits).map(v => v.std));
+
+  return {
+    windowCount: windowStats.length,
+    frameCount: windowStats.reduce((sum, w) => sum + w.frameCount, 0),
+    headMovement,
+    blinkRate: mean(windowStats.map(w => w.eyeMetrics.blinkRate)),
+    avgEAR: mean(windowStats.map(w => w.eyeMetrics.avgEAR.mean)),
+    smileProbability: mean(windowStats.map(w => w.smileProbability.mean)),
+    expressionVariability,
+    actionUnits,
+  };
+}
+
+// ============================================================================
 // Facial Insights Functions
 // ============================================================================
 
 function generateFacialInsights(prediction: PHQ9Prediction, checkin?: CheckinResponse): FacialInsight[] {
   const insights: FacialInsight[] = [];
 
-  if (prediction.score < 5) {
-    insights.push({
-      title: 'การแสดงออกทางใบหน้าเป็นธรรมชาติ',
-      description: 'ระบบตรวจพบการเคลื่อนไหวของกล้ามเนื้อใบหน้าที่สมดุลและเป็นธรรมชาติ',
-      icon: '😊',
-      type: 'positive',
-    });
-  }
+  const indicatorMeta: Record<string, { title: string; icon: string; unit?: string }> = {
+    lip_corner_depression: { title: 'มุมปากตก (AU15)', icon: '😔' },
+    smile_expression: { title: 'รอยยิ้ม (AU12/AU06)', icon: '😊' },
+    head_movement: { title: 'การเคลื่อนไหวศีรษะ', icon: '🧭', unit: '°' },
+    brow_expression: { title: 'การยกคิ้ว (AU02)', icon: '🧐' },
+    expression_variability: { title: 'ความหลากหลายการแสดงออก', icon: '🎭' },
+    blink_rate: { title: 'อัตราการกะพริบตา', icon: '👁️', unit: 'ครั้ง/นาที' },
+  };
 
-  if (prediction.riskIndicators.some(r => r.feature.includes('smile'))) {
-    insights.push({
-      title: 'ความเข้มของรอยยิ้มลดลง',
-      description: 'กล้ามเนื้อบริเวณมุมปากและรอบดวงตา (AU6, AU12) มีการเคลื่อนไหวน้อยกว่าค่าปกติ',
-      icon: '🔍',
-      type: 'attention',
-    });
-  }
+  const indicatorPriority = (significance: 'low' | 'medium' | 'high') =>
+    significance === 'high' ? 0 : significance === 'medium' ? 1 : 2;
 
-  if (prediction.riskIndicators.some(r => r.feature.includes('head') || r.feature.includes('movement'))) {
-    insights.push({
-      title: 'การเคลื่อนไหวศีรษะลดลง',
-      description: 'ตรวจพบการเคลื่อนไหวศีรษะน้อยกว่าค่ามาตรฐาน ซึ่งอาจเกี่ยวข้องกับความล้าสะสม',
-      icon: '📊',
-      type: 'attention',
-    });
-  }
+  const sortedIndicators = [...prediction.riskIndicators]
+    .sort((a, b) => indicatorPriority(a.significance) - indicatorPriority(b.significance))
+    .slice(0, 4);
 
-  if (prediction.riskIndicators.some(r => r.feature.includes('blink') || r.feature.includes('eye'))) {
+  sortedIndicators.forEach((indicator) => {
+    const meta = indicatorMeta[indicator.feature] || { title: indicator.feature, icon: '📌' };
+    const valueLabel = Number.isFinite(indicator.value)
+      ? indicator.feature === 'blink_rate'
+        ? Math.round(indicator.value).toString()
+        : indicator.feature === 'head_movement'
+          ? indicator.value.toFixed(1)
+          : indicator.value.toFixed(2)
+      : '-';
+    const baselineLabel = Number.isFinite(indicator.baseline)
+      ? indicator.feature === 'blink_rate'
+        ? Math.round(indicator.baseline).toString()
+        : indicator.feature === 'head_movement'
+          ? indicator.baseline.toFixed(1)
+          : indicator.baseline.toFixed(2)
+      : '-';
+    const unit = meta.unit ? ` ${meta.unit}` : '';
+
     insights.push({
-      title: 'รูปแบบการกะพริบตาผิดปกติ',
-      description: 'อัตราการกะพริบตามีความแตกต่างจากค่าเฉลี่ย อาจเกี่ยวข้องกับความเหนื่อยล้าหรือความเครียด',
-      icon: '👁️',
-      type: 'neutral',
+      title: meta.title,
+      description: `${indicator.description} (ค่า: ${valueLabel}${unit}, ฐาน: ${baselineLabel}${unit})`,
+      icon: meta.icon,
+      type: indicator.significance === 'high' ? 'attention' : indicator.significance === 'medium' ? 'neutral' : 'positive',
     });
-  }
+  });
 
   if (checkin) {
     if (checkin.sleepQuality <= 2) {
@@ -582,6 +650,7 @@ function generateFacialInsights(prediction: PHQ9Prediction, checkin?: CheckinRes
 // ============================================================================
 
 function generateTimeBasedRecommendations(
+  prediction: PHQ9Prediction,
   wellness: WellnessScore,
   timeContext: TimeContext,
   checkin?: CheckinResponse
@@ -589,62 +658,93 @@ function generateTimeBasedRecommendations(
   const immediate: string[] = [];
   const today: string[] = [];
   const thisWeek: string[] = [];
+  const pushUnique = (list: string[], value?: string) => {
+    if (!value) return;
+    if (!list.includes(value)) list.push(value);
+  };
+
+  // Model-driven recommendations first (reflects actual prediction)
+  const modelRecs = prediction.recommendations || [];
+  pushUnique(immediate, modelRecs[0]);
+  if (prediction.score >= 10) {
+    pushUnique(immediate, modelRecs[1]);
+  } else {
+    pushUnique(today, modelRecs[1]);
+  }
 
   // Time-specific immediate actions
   if (timeContext.period === 'morning') {
     if (wellness.energy < 50) {
-      immediate.push('ดื่มน้ำ 1 แก้วและออกไปรับแสงแดดยามเช้า 5 นาที');
+      pushUnique(immediate, 'ดื่มน้ำ 1 แก้วและออกไปรับแสงแดดยามเช้า 5 นาที');
     } else {
-      immediate.push('เช้านี้พลังงานดี ลองวางแผนทำสิ่งสำคัญที่สุดของวันตอนนี้');
+      pushUnique(immediate, 'เช้านี้พลังงานดี ลองวางแผนทำสิ่งสำคัญที่สุดของวันตอนนี้');
     }
   } else if (timeContext.period === 'afternoon') {
     if (wellness.fatigue > 50) {
-      immediate.push('ช่วงบ่ายง่วงเป็นธรรมชาติ ลองเดินเล่น 5 นาทีหรืองีบสั้นๆ');
+      pushUnique(immediate, 'ช่วงบ่ายง่วงเป็นธรรมชาติ ลองเดินเล่น 5 นาทีหรืองีบสั้นๆ');
     }
-    immediate.push('ดื่มน้ำและกินของว่างที่มีโปรตีนเพื่อเพิ่มพลังงาน');
+    pushUnique(immediate, 'ดื่มน้ำและกินของว่างที่มีโปรตีนเพื่อเพิ่มพลังงาน');
   } else if (timeContext.period === 'evening') {
-    immediate.push('ช่วงเย็นแล้ว ลองทำกิจกรรมผ่อนคลายที่ชอบสักอย่าง');
+    pushUnique(immediate, 'ช่วงเย็นแล้ว ลองทำกิจกรรมผ่อนคลายที่ชอบสักอย่าง');
     if (wellness.stress > 50) {
-      immediate.push('หายใจลึกๆ 3 ครั้ง ปล่อยความเครียดของวันออกไป');
+      pushUnique(immediate, 'หายใจลึกๆ 3 ครั้ง ปล่อยความเครียดของวันออกไป');
     }
   } else {
-    immediate.push('ดึกแล้ว ลดแสงหน้าจอและเตรียมตัวนอน');
-    immediate.push('ลองทำ stretching เบาๆ หรือฟังเพลงผ่อนคลายก่อนนอน');
+    pushUnique(immediate, 'ดึกแล้ว ลดแสงหน้าจอและเตรียมตัวนอน');
+    pushUnique(immediate, 'ลองทำ stretching เบาๆ หรือฟังเพลงผ่อนคลายก่อนนอน');
   }
 
   // Stress-based recommendations
   if (wellness.stress > 60) {
-    immediate.push('หายใจลึก 3 ครั้ง - สูดเข้า 4 วินาที กลั้น 4 วินาที ปล่อยออก 6 วินาที');
-    today.push('จัดเวลาพัก 15 นาทีทำสิ่งที่ผ่อนคลาย');
+    pushUnique(immediate, 'หายใจลึก 3 ครั้ง - สูดเข้า 4 วินาที กลั้น 4 วินาที ปล่อยออก 6 วินาที');
+    pushUnique(today, 'จัดเวลาพัก 15 นาทีทำสิ่งที่ผ่อนคลาย');
   }
 
   // Today recommendations based on time
   if (timeContext.period === 'morning' || timeContext.period === 'afternoon') {
     if (wellness.energy < 60) {
-      today.push('พยายามออกไปเดินกลางแจ้งอย่างน้อย 15 นาทีวันนี้');
+      pushUnique(today, 'พยายามออกไปเดินกลางแจ้งอย่างน้อย 15 นาทีวันนี้');
     }
-    today.push('กำหนดเวลาเลิกงานที่ชัดเจน ไม่ทำงานเลยเวลา');
+    pushUnique(today, 'กำหนดเวลาเลิกงานที่ชัดเจน ไม่ทำงานเลยเวลา');
   } else {
-    today.push('คืนนี้นอนให้เร็วกว่าปกติ 30 นาที');
+    pushUnique(today, 'คืนนี้นอนให้เร็วกว่าปกติ 30 นาที');
     if (checkin && checkin.sleepQuality <= 3) {
-      today.push('ปิดหน้าจอทุกชนิดก่อนนอน 1 ชั่วโมง');
+      pushUnique(today, 'ปิดหน้าจอทุกชนิดก่อนนอน 1 ชั่วโมง');
     }
   }
 
   // This week recommendations
-  thisWeek.push('ตั้งเป้าเช็คอินสุขภาวะอารมณ์ทุกวันเพื่อติดตามแนวโน้ม');
+  pushUnique(thisWeek, 'ตั้งเป้าเช็คอินสุขภาวะอารมณ์ทุกวันเพื่อติดตามแนวโน้ม');
   if (wellness.fatigue > 50 || (checkin && checkin.sleepQuality <= 3)) {
-    thisWeek.push('ปรับปรุงการนอน: ห้องมืด เย็น นอนเวลาเดิมทุกวัน');
+    pushUnique(thisWeek, 'ปรับปรุงการนอน: ห้องมืด เย็น นอนเวลาเดิมทุกวัน');
   }
-  thisWeek.push('ออกกำลังกายเบาๆ อย่างน้อย 3 ครั้ง ครั้งละ 20 นาที');
+  pushUnique(thisWeek, 'ออกกำลังกายเบาๆ อย่างน้อย 3 ครั้ง ครั้งละ 20 นาที');
   if (wellness.stress > 50) {
-    thisWeek.push('ลองฝึก meditation หรือ mindfulness 10 นาที/วัน');
+    pushUnique(thisWeek, 'ลองฝึก meditation หรือ mindfulness 10 นาที/วัน');
   }
 
   return {
     immediate: immediate.slice(0, 2),
     today: today.slice(0, 3),
     thisWeek: thisWeek.slice(0, 3),
+  };
+}
+
+function getNextCheckinSuggestion(risks: MentalHealthRisk[], timestamp: number) {
+  const priority = { high: 0, elevated: 1, moderate: 2, low: 3 };
+  const highest = [...risks].sort((a, b) => priority[a.risk] - priority[b.risk])[0];
+  const hours =
+    highest?.risk === 'high' ? 6 :
+    highest?.risk === 'elevated' ? 12 :
+    highest?.risk === 'moderate' ? 24 :
+    48;
+  const nextDate = new Date(timestamp + hours * 60 * 60 * 1000);
+  const timeLabel = nextDate.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+  const dateLabel = nextDate.toLocaleDateString('th-TH', { weekday: 'short', day: 'numeric', month: 'short' });
+
+  return {
+    title: 'นัดหมายเช็คอินครั้งถัดไป',
+    description: `แนะนำให้เช็คอินอีกครั้งภายใน ${hours} ชั่วโมง (ประมาณ ${dateLabel} ${timeLabel}) เพื่อดูแนวโน้มของคุณ`,
   };
 }
 
@@ -754,23 +854,62 @@ function RiskCard({ risk, isExpanded, onToggle }: { risk: MentalHealthRisk; isEx
 export default function WellnessResult({
   prediction,
   checkinResponse,
+  phq9Response,
   onReset,
-  onSaveHistory,
-  onDownloadPDF,
   scanTimestamp,
+  debugData,
 }: Props) {
   const [expandedRisk, setExpandedRisk] = useState<string | null>(null);
   const [showAllRisks, setShowAllRisks] = useState(false);
+  const [savedToCloud, setSavedToCloud] = useState(false);
+  const { isAuthenticated, user } = useAuthStore();
 
   const currentTimestamp = scanTimestamp || Date.now();
   const scanDate = new Date(currentTimestamp);
 
   const timeContext = useMemo(() => getTimeContext(currentTimestamp), [currentTimestamp]);
 
+  // Calculate wellness first for use in useEffect
   const wellness = useMemo(
     () => calculateWellnessScore(prediction, checkinResponse),
     [prediction, checkinResponse]
   );
+
+  // Auto-save to cloud when user is logged in
+  useEffect(() => {
+    const saveToCloud = async () => {
+      if (!isAuthenticated || savedToCloud) return;
+
+      try {
+        const response = await authClient.fetch('/api/scans', {
+          method: 'POST',
+          body: JSON.stringify({
+            phq9_score: prediction.score,
+            severity: prediction.severity,
+            confidence: prediction.confidence,
+            energy_level: wellness.energy,
+            stress_level: wellness.stress,
+            fatigue_level: wellness.fatigue,
+            risk_indicators: prediction.riskIndicators,
+            session_id: debugData?.session.sessionId,
+            window_count: debugData?.session.windowStats?.length || 0,
+            total_frames: debugData?.session.windowStats?.reduce((sum, w) => sum + w.frameCount, 0) || 0,
+          }),
+        });
+
+        if (response.ok) {
+          setSavedToCloud(true);
+          console.log('Scan saved to cloud');
+        }
+      } catch (error) {
+        console.error('Failed to save scan to cloud:', error);
+      }
+    };
+
+    // Small delay to ensure wellness is calculated
+    const timer = setTimeout(saveToCloud, 500);
+    return () => clearTimeout(timer);
+  }, [isAuthenticated, savedToCloud, prediction, debugData, wellness]);
 
   const overallConfig = getOverallConfig(wellness.overall);
 
@@ -785,9 +924,120 @@ export default function WellnessResult({
   );
 
   const recommendations = useMemo(
-    () => generateTimeBasedRecommendations(wellness, timeContext, checkinResponse),
-    [wellness, timeContext, checkinResponse]
+    () => generateTimeBasedRecommendations(prediction, wellness, timeContext, checkinResponse),
+    [prediction, wellness, timeContext, checkinResponse]
   );
+
+  const nextCheckin = useMemo(
+    () => getNextCheckinSuggestion(mentalHealthRisks, currentTimestamp),
+    [mentalHealthRisks, currentTimestamp]
+  );
+
+  const rawSummary = useMemo(
+    () => summarizeWindowStats(debugData?.session.windowStats || []),
+    [debugData]
+  );
+
+  const exportPayload = useMemo(() => {
+    const sessionId = debugData?.session.sessionId || `scan_${currentTimestamp}`;
+    return {
+      exportVersion: 1,
+      exportedAt: Date.now(),
+      scanTimestamp: currentTimestamp,
+      sessionId,
+      backend: debugData?.backend || null,
+      scanConfig: debugData?.scanConfig || null,
+      checkinResponse: checkinResponse || null,
+      phq9Response: phq9Response || null,
+      model: {
+        prediction,
+        rawSummary,
+        windowStats: debugData?.session.windowStats || [],
+        baseline: debugData?.baseline || null,
+      },
+      program: {
+        wellness,
+        overall: wellness.overall,
+        mentalHealthRisks,
+        facialInsights,
+        recommendations,
+        timeContext,
+        nextCheckin,
+      },
+    };
+  }, [
+    debugData,
+    prediction,
+    rawSummary,
+    wellness,
+    mentalHealthRisks,
+    facialInsights,
+    recommendations,
+    timeContext,
+    nextCheckin,
+    checkinResponse,
+    phq9Response,
+    currentTimestamp,
+  ]);
+
+  const saveHistory = () => {
+    try {
+      const key = 'facepsy_scan_history';
+      const existing = JSON.parse(localStorage.getItem(key) || '[]');
+      const next = Array.isArray(existing) ? [...existing, exportPayload] : [exportPayload];
+      localStorage.setItem(key, JSON.stringify(next.slice(-50)));
+      alert('บันทึกประวัติเรียบร้อย');
+    } catch (error) {
+      console.error('Save history failed:', error);
+      alert('บันทึกประวัติไม่สำเร็จ');
+    }
+  };
+
+  const exportJson = () => {
+    try {
+      const date = new Date(currentTimestamp);
+      const fileName = `facepsy-scan-${date.toISOString().replace(/[:.]/g, '-')}.json`;
+      const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Export JSON failed:', error);
+      alert('ดาวน์โหลดไม่สำเร็จ');
+    }
+  };
+
+  const exportHistory = () => {
+    try {
+      const key = 'facepsy_scan_history';
+      const history = JSON.parse(localStorage.getItem(key) || '[]');
+      if (!Array.isArray(history) || history.length === 0) {
+        alert('ยังไม่มีประวัติที่บันทึกไว้');
+        return;
+      }
+      const fileName = `facepsy-history-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Export history failed:', error);
+      alert('ดาวน์โหลดประวัติไม่สำเร็จ');
+    }
+  };
+
+  const formatValue = (value: number, digits: number = 2) =>
+    Number.isFinite(value) ? value.toFixed(digits) : '-';
 
   // Sort risks by severity
   const sortedRisks = [...mentalHealthRisks].sort((a, b) => {
@@ -796,6 +1046,8 @@ export default function WellnessResult({
   });
 
   const displayedRisks = showAllRisks ? sortedRisks : sortedRisks.slice(0, 2);
+  const baselineMissing = !debugData?.baseline;
+  const backendMode = debugData?.backend?.mode || 'unknown';
 
   return (
     <div className="max-w-md mx-auto p-4 space-y-5">
@@ -821,6 +1073,17 @@ export default function WellnessResult({
           <p className="text-sm text-white/90">{timeContext.insight}</p>
         </div>
       </div>
+
+      {(baselineMissing || backendMode !== 'backend') && (
+        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3">
+          <p className="text-xs text-amber-800">
+            <strong>คำเตือนความแม่นยำ:</strong>{' '}
+            {baselineMissing
+              ? 'ยังไม่มีการปรับเทียบ (baseline) ทำให้ผลอาจคลาดเคลื่อนจากค่าจริงของผู้ใช้'
+              : 'ระบบกำลังทำงานในโหมดสำรอง (ไม่ใช้ AI Model หลัก) ความแม่นยำอาจลดลง'}
+          </p>
+        </div>
+      )}
 
       {/* Overall Status */}
       <div className={`${overallConfig.bg} ${overallConfig.border} border rounded-2xl p-5`}>
@@ -884,6 +1147,30 @@ export default function WellnessResult({
         </div>
       </div>
 
+      {phq9Response && (
+        <div className="bg-white rounded-2xl p-5 border border-gray-200">
+          <h2 className="text-sm font-medium text-gray-700 flex items-center gap-2 mb-3">
+            <span className="w-6 h-6 bg-emerald-100 rounded-full flex items-center justify-center text-sm">📝</span>
+            ผลแบบประเมิน PHQ-9
+          </h2>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs text-gray-500">คะแนนรวม</p>
+              <p className="text-xl font-semibold text-gray-800">{phq9Response.totalScore}/27</p>
+            </div>
+            <div className="text-right">
+              <p className="text-xs text-gray-500">ระดับอาการ</p>
+              <p className="text-sm font-medium text-gray-800">
+                {formatPHQ9Severity(phq9Response.severity)}
+              </p>
+            </div>
+          </div>
+          <p className="text-xs text-gray-500 mt-3">
+            แบบประเมินนี้ใช้เพื่อการติดตามอาการเท่านั้น ไม่ใช่การวินิจฉัยทางการแพทย์
+          </p>
+        </div>
+      )}
+
       {/* Time-Based Pattern Insight */}
       <div className="bg-gradient-to-r from-cyan-50 to-blue-50 rounded-2xl p-5 border border-cyan-100">
         <h3 className="text-sm font-medium text-cyan-800 mb-3 flex items-center gap-2">
@@ -936,6 +1223,53 @@ export default function WellnessResult({
           ))}
         </div>
       </div>
+
+      {/* Raw Model Summary */}
+      {rawSummary && (
+        <div className="bg-white rounded-2xl p-5 border border-gray-200">
+          <h2 className="text-sm font-medium text-gray-700 mb-4 flex items-center gap-2">
+            <span className="w-6 h-6 bg-emerald-100 rounded-full flex items-center justify-center text-sm">🧪</span>
+            ค่าที่โมเดลตรวจจับได้ (สรุป)
+          </h2>
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">AU12 (ยิ้ม)</p>
+              <p className="font-medium text-gray-800">{formatValue(rawSummary.actionUnits.AU12?.mean || 0)}</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">AU06 (แก้มยก)</p>
+              <p className="font-medium text-gray-800">{formatValue(rawSummary.actionUnits.AU06?.mean || 0)}</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">AU15 (มุมปากตก)</p>
+              <p className="font-medium text-gray-800">{formatValue(rawSummary.actionUnits.AU15?.mean || 0)}</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">AU02 (คิ้ว)</p>
+              <p className="font-medium text-gray-800">{formatValue(rawSummary.actionUnits.AU02?.mean || 0)}</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">Smile Probability</p>
+              <p className="font-medium text-gray-800">{formatValue(rawSummary.smileProbability)}</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">Blink Rate</p>
+              <p className="font-medium text-gray-800">{Math.round(rawSummary.blinkRate)} ครั้ง/นาที</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">Head Movement</p>
+              <p className="font-medium text-gray-800">{formatValue(rawSummary.headMovement, 1)}°</p>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <p className="text-xs text-gray-500">Expression Variability</p>
+              <p className="font-medium text-gray-800">{formatValue(rawSummary.expressionVariability)}</p>
+            </div>
+          </div>
+          <p className="text-xs text-gray-500 mt-3">
+            ค่านี้เป็นค่าเฉลี่ยของทั้งเซสชัน (หน้าต่าง {rawSummary.windowCount} ชุด / {rawSummary.frameCount} เฟรม)
+          </p>
+        </div>
+      )}
 
       {/* Time-Based Recommendations */}
       <div className="bg-gradient-to-br from-violet-50 to-indigo-50 rounded-2xl p-5 border border-violet-100">
@@ -1003,13 +1337,9 @@ export default function WellnessResult({
         <div className="flex items-start gap-3">
           <span className="text-2xl">📅</span>
           <div>
-            <h3 className="font-medium text-green-800">นัดหมายเช็คอินครั้งถัดไป</h3>
+            <h3 className="font-medium text-green-800">{nextCheckin.title}</h3>
             <p className="text-sm text-green-600 mt-1">
-              {timeContext.period === 'morning'
-                ? 'แนะนำให้เช็คอินอีกครั้งตอนเย็น เพื่อเปรียบเทียบอารมณ์ช่วงเช้าและเย็น'
-                : timeContext.period === 'afternoon'
-                ? 'แนะนำให้เช็คอินอีกครั้งพรุ่งนี้เช้า เพื่อดูว่านอนหลับดีขึ้นไหม'
-                : 'แนะนำให้เช็คอินพรุ่งนี้เช้า เพื่อเริ่มต้นวันใหม่ด้วยการเข้าใจตัวเอง'}
+              {nextCheckin.description}
             </p>
             <p className="text-xs text-green-500 mt-2">
               การเช็คอินต่อเนื่อง 7 วัน จะช่วยให้ระบบวิเคราะห์แนวโน้มของคุณได้แม่นยำขึ้น
@@ -1052,41 +1382,98 @@ export default function WellnessResult({
           ตรวจอีกครั้ง
         </button>
 
-        <div className="grid grid-cols-2 gap-3">
-          <button
-            onClick={onSaveHistory}
-            className="py-3 border border-gray-200 bg-white text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-all text-sm flex items-center justify-center gap-2"
-          >
-            <span>📊</span> บันทึกประวัติ
-          </button>
-          <button
-            onClick={onDownloadPDF}
-            className="py-3 border border-gray-200 bg-white text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-all text-sm flex items-center justify-center gap-2"
-          >
-            <span>📄</span> ดาวน์โหลด PDF
-          </button>
-        </div>
+      <div className="grid grid-cols-2 gap-3">
+        <button
+          onClick={saveHistory}
+          className="py-3 border border-gray-200 bg-white text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-all text-sm flex items-center justify-center gap-2"
+        >
+          <span>📊</span> บันทึกผลลัพธ์
+        </button>
+        <button
+          onClick={exportJson}
+          className="py-3 border border-gray-200 bg-white text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-all text-sm flex items-center justify-center gap-2"
+        >
+          <span>📄</span> ดาวน์โหลด JSON
+        </button>
       </div>
 
-      {/* Premium Upgrade CTA */}
-      <div className="bg-gradient-to-r from-violet-600 to-indigo-600 rounded-2xl p-5 text-white">
-        <div className="flex items-start gap-3">
-          <span className="text-3xl">✨</span>
-          <div className="flex-1">
-            <h3 className="font-semibold mb-1">ปลดล็อคการวิเคราะห์เชิงลึก</h3>
-            <ul className="text-sm text-violet-100 space-y-1 mb-3">
-              <li>• ดูแนวโน้มความเสี่ยงย้อนหลัง 30 วัน</li>
-              <li>• เปรียบเทียบผลตามช่วงเวลาของวัน</li>
-              <li>• รับการแจ้งเตือนเมื่อความเสี่ยงสูงขึ้น</li>
-              <li>• แผนดูแลตัวเอง 7 วันที่ปรับตามคุณ</li>
-            </ul>
-            <button className="w-full py-2.5 bg-white text-violet-600 font-medium rounded-lg hover:bg-violet-50 transition-all">
-              เริ่มต้น Pro - ฿199/เดือน
-            </button>
-            <p className="text-xs text-violet-200 text-center mt-2">ทดลองฟรี 7 วัน • ยกเลิกได้ทุกเมื่อ</p>
+      <button
+        onClick={exportHistory}
+        className="w-full py-3 border border-gray-200 bg-white text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-all text-sm flex items-center justify-center gap-2"
+      >
+        <span>🗂️</span> ดาวน์โหลดประวัติทั้งหมด (JSON)
+      </button>
+      </div>
+
+      {/* Cloud Save Status / Login CTA */}
+      {isAuthenticated ? (
+        savedToCloud ? (
+          <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex items-center gap-3">
+            <span className="text-2xl">✅</span>
+            <div>
+              <h3 className="font-medium text-emerald-800">บันทึกผลเรียบร้อย</h3>
+              <p className="text-sm text-emerald-600">ผลการตรวจถูกบันทึกในบัญชีของคุณแล้ว</p>
+            </div>
+            <Link
+              href="/dashboard"
+              className="ml-auto px-4 py-2 bg-emerald-600 text-white text-sm font-medium rounded-lg hover:bg-emerald-700"
+            >
+              ดูแดชบอร์ด
+            </Link>
+          </div>
+        ) : null
+      ) : (
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
+          <div className="flex items-start gap-3">
+            <span className="text-2xl">💾</span>
+            <div className="flex-1">
+              <h3 className="font-medium text-blue-800 mb-1">เข้าสู่ระบบเพื่อบันทึกประวัติ</h3>
+              <p className="text-sm text-blue-600 mb-3">
+                สร้างบัญชีฟรี เพื่อเก็บประวัติการตรวจและติดตามแนวโน้มของคุณ
+              </p>
+              <div className="flex gap-2">
+                <Link
+                  href="/login"
+                  className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700"
+                >
+                  เข้าสู่ระบบ
+                </Link>
+                <Link
+                  href="/register"
+                  className="px-4 py-2 border border-blue-300 text-blue-700 text-sm font-medium rounded-lg hover:bg-blue-50"
+                >
+                  สมัครสมาชิก
+                </Link>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
+      )}
+
+      {/* Premium Upgrade CTA */}
+      {(!user?.is_pro) && (
+        <div className="bg-gradient-to-r from-violet-600 to-indigo-600 rounded-2xl p-5 text-white">
+          <div className="flex items-start gap-3">
+            <span className="text-3xl">✨</span>
+            <div className="flex-1">
+              <h3 className="font-semibold mb-1">ปลดล็อคการวิเคราะห์เชิงลึก</h3>
+              <ul className="text-sm text-violet-100 space-y-1 mb-3">
+                <li>• ดูแนวโน้มความเสี่ยงย้อนหลัง 90 วัน</li>
+                <li>• เปรียบเทียบผลตามช่วงเวลาของวัน</li>
+                <li>• รับการแจ้งเตือนเมื่อความเสี่ยงสูงขึ้น</li>
+                <li>• แผนดูแลตัวเอง 7 วันที่ปรับตามคุณ</li>
+              </ul>
+              <Link
+                href="/pricing"
+                className="block w-full py-2.5 bg-white text-violet-600 font-medium rounded-lg hover:bg-violet-50 transition-all text-center"
+              >
+                สมัคร Pro - ฿199/เดือน
+              </Link>
+              <p className="text-xs text-violet-200 text-center mt-2">ยกเลิกได้ทุกเมื่อ</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Professional Help CTA for high risk */}
       {(mentalHealthRisks.some(r => r.risk === 'high' || r.risk === 'elevated')) && (

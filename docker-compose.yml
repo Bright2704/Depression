@@ -1,0 +1,70 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    platform: linux/amd64
+    ports:
+      - "8000:8000"
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - DATABASE_URL=mysql+pymysql://mindcheck:mindcheck_password@mysql:3306/mindcheck
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - FACEBOOK_APP_ID=${FACEBOOK_APP_ID:-}
+      - FACEBOOK_APP_SECRET=${FACEBOOK_APP_SECRET:-}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - STRIPE_PRICE_PRO_MONTHLY=${STRIPE_PRICE_PRO_MONTHLY:-}
+      - STRIPE_PRICE_PRO_YEARLY=${STRIPE_PRICE_PRO_YEARLY:-}
+    depends_on:
+      backend:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password}
+      MYSQL_DATABASE: mindcheck
+      MYSQL_USER: mindcheck
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-mindcheck_password}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root_password}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: mindcheck
+      PMA_PASSWORD: ${MYSQL_PASSWORD:-mindcheck_password}
+    ports:
+      - "8080:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:

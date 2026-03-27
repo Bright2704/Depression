@@ -4,5 +4,22 @@ python-multipart==0.0.6
 opencv-python==4.8.1.78
 numpy==1.24.3
 mediapipe==0.10.8
-tflite-runtime==2.14.0
+tflite-runtime==2.14.0; platform_system != "Darwin"
 Pillow==10.1.0
+
+# Database
+sqlalchemy==2.0.23
+pymysql==1.1.0
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# OAuth
+httpx==0.25.2
+
+# Validation
+pydantic[email]==2.5.2
+
+# Payments
+stripe==7.8.0

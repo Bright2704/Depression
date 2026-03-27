@@ -121,6 +121,14 @@ const FEATURE_WEIGHTS = {
   expressionVariability: 0.10,
 };
 
+const TOTAL_RISK_WEIGHT =
+  FEATURE_WEIGHTS.AU15 +
+  FEATURE_WEIGHTS.AU12 +
+  FEATURE_WEIGHTS.headMovement +
+  FEATURE_WEIGHTS.AU02 +
+  FEATURE_WEIGHTS.expressionVariability +
+  FEATURE_WEIGHTS.blinkRate;
+
 // Depression-associated thresholds
 const DEPRESSION_THRESHOLDS = {
   // Low values indicate depression risk
@@ -327,7 +335,11 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   const current = aggregateWindowStats(windowStats);
   const riskIndicators: RiskIndicator[] = [];
   let totalRiskScore = 0;
-  let weightSum = 0;
+  const avgFps = mean(windowStats.map(w => {
+    const durationSec = Math.max(1, (w.windowEnd - w.windowStart) / 1000);
+    return w.frameCount / durationSec;
+  }));
+  const blinkReliable = avgFps >= 5;
 
   // =========================================================================
   // Feature 1: AU15 - Lip Corner Depressor (strongest predictor)
@@ -339,7 +351,7 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   if (au15Value > DEPRESSION_THRESHOLDS.AU15_high || au15Deviation > 0.1) {
     const contribution = normalizeScore(au15Value, 0, 0.5) * FEATURE_WEIGHTS.AU15;
     totalRiskScore += contribution;
-    weightSum += FEATURE_WEIGHTS.AU15;
+    // AU15 contributes strongly to risk
 
     riskIndicators.push({
       feature: 'lip_corner_depression',
@@ -356,16 +368,20 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   // =========================================================================
   const au12Value = current.actionUnits.AU12?.mean || 0;
   const au06Value = current.actionUnits.AU06?.mean || 0;
-  const smileScore = (au12Value + au06Value) / 2;
-  const smileBaseline = baseline
+  const smileFromAU = (au12Value + au06Value) / 2;
+  const smileFromProbability = current.smileProbability.mean || 0;
+  const smileScore = Math.max(smileFromAU, smileFromProbability);
+  const smileBaselineFromAU = baseline
     ? (baseline.features.actionUnits.AU12?.mean || 0 + baseline.features.actionUnits.AU06?.mean || 0) / 2
     : 0.25;
+  const smileBaselineFromProbability = baseline?.features.smileProbability.mean ?? 0.25;
+  const smileBaseline = Math.max(smileBaselineFromAU, smileBaselineFromProbability);
   const smileDeviation = smileBaseline - smileScore;
 
   if (smileScore < DEPRESSION_THRESHOLDS.AU12_low || smileDeviation > 0.1) {
     const contribution = (1 - normalizeScore(smileScore, 0, 0.4)) * FEATURE_WEIGHTS.AU12;
     totalRiskScore += contribution;
-    weightSum += FEATURE_WEIGHTS.AU12;
+    // Smile reduction contributes to risk
 
     riskIndicators.push({
       feature: 'smile_expression',
@@ -391,7 +407,7 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   if (headMovement < DEPRESSION_THRESHOLDS.headMovement_low || headDeviation > 5) {
     const contribution = (1 - normalizeScore(headMovement, 0, 20)) * FEATURE_WEIGHTS.headMovement;
     totalRiskScore += contribution;
-    weightSum += FEATURE_WEIGHTS.headMovement;
+    // Reduced head movement contributes to risk
 
     riskIndicators.push({
       feature: 'head_movement',
@@ -413,7 +429,7 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   if (au02Deviation > 0.05) {
     const contribution = (1 - normalizeScore(au02Value, 0, 0.3)) * FEATURE_WEIGHTS.AU02;
     totalRiskScore += contribution;
-    weightSum += FEATURE_WEIGHTS.AU02;
+    // Reduced brow activity contributes to risk
 
     riskIndicators.push({
       feature: 'brow_expression',
@@ -439,7 +455,7 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   if (variabilityDeviation > 0.03) {
     const contribution = (1 - normalizeScore(expressionVariability, 0, 0.2)) * FEATURE_WEIGHTS.expressionVariability;
     totalRiskScore += contribution;
-    weightSum += FEATURE_WEIGHTS.expressionVariability;
+    // Low variability contributes to risk
 
     riskIndicators.push({
       feature: 'expression_variability',
@@ -457,10 +473,10 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   const blinkRate = current.eyeMetrics.blinkRate;
   const blinkBaseline = baseline?.features.eyeMetrics.blinkRate || 15;
 
-  if (blinkRate < DEPRESSION_THRESHOLDS.blinkRate_low || blinkRate > DEPRESSION_THRESHOLDS.blinkRate_high) {
+  if (blinkReliable && (blinkRate < DEPRESSION_THRESHOLDS.blinkRate_low || blinkRate > DEPRESSION_THRESHOLDS.blinkRate_high)) {
     const contribution = FEATURE_WEIGHTS.blinkRate;
     totalRiskScore += contribution;
-    weightSum += FEATURE_WEIGHTS.blinkRate;
+    // Abnormal blink rate contributes to risk
 
     riskIndicators.push({
       feature: 'blink_rate',
@@ -479,7 +495,7 @@ export function predictPHQ9(input: PredictionInput): PHQ9Prediction {
   // =========================================================================
 
   // Normalize and scale to PHQ-9 range (0-27)
-  const normalizedRisk = weightSum > 0 ? totalRiskScore / weightSum : 0;
+  const normalizedRisk = TOTAL_RISK_WEIGHT > 0 ? totalRiskScore / TOTAL_RISK_WEIGHT : 0;
   const rawScore = sigmoid((normalizedRisk - 0.3) * 8) * 27;
 
   // Apply smoothing and bounds
@@ -562,18 +578,27 @@ function calculateConfidence(windowStats: WindowStatistics[], baseline?: UserBas
   const dataPoints = windowStats.reduce((sum, w) => sum + w.frameCount, 0);
   confidence += Math.min(0.2, dataPoints / 500);  // Up to +0.2 for sufficient data
 
+  // Penalize low sampling rate (blink/eye dynamics less reliable)
+  const avgFps = mean(windowStats.map(w => {
+    const durationSec = Math.max(1, (w.windowEnd - w.windowStart) / 1000);
+    return w.frameCount / durationSec;
+  }));
+  if (avgFps < 3) confidence -= 0.1;
+
   // Having a baseline increases confidence
   if (baseline) {
     confidence += 0.15;
 
     // Mature baseline (more samples) = even higher confidence
     if (baseline.sampleCount > 10) confidence += 0.1;
+  } else {
+    confidence -= 0.1;
   }
 
   // Multiple windows increase reliability
   if (windowStats.length >= 3) confidence += 0.05;
 
-  return Math.min(0.95, confidence);
+  return Math.max(0, Math.min(0.95, confidence));
 }
 
 function generateRecommendations(score: number, indicators: RiskIndicator[]): string[] {

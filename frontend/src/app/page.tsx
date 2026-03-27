@@ -3,31 +3,16 @@
  * Professional, trustworthy design for emotional wellness screening
  */
 
+'use client';
+
 import Link from 'next/link';
+import NavBar from '@/components/NavBar';
 
 export default function LandingPage() {
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white">
       {/* Navigation */}
-      <nav className="fixed top-0 w-full bg-white/80 backdrop-blur-md z-50 border-b border-gray-100">
-        <div className="max-w-6xl mx-auto px-4 py-4 flex justify-between items-center">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-gradient-to-br from-violet-600 to-indigo-600 rounded-lg"></div>
-            <span className="text-xl font-semibold text-gray-800">MindCheck</span>
-          </div>
-          <div className="flex items-center gap-6">
-            <Link href="#how-it-works" className="text-gray-600 hover:text-gray-800 text-sm">วิธีการทำงาน</Link>
-            <Link href="#privacy" className="text-gray-600 hover:text-gray-800 text-sm">ความเป็นส่วนตัว</Link>
-            <Link href="#pricing" className="text-gray-600 hover:text-gray-800 text-sm">ราคา</Link>
-            <Link
-              href="/scan"
-              className="px-4 py-2 bg-gradient-to-r from-violet-600 to-indigo-600 text-white text-sm font-medium rounded-lg hover:from-violet-700 hover:to-indigo-700 transition-all"
-            >
-              เริ่มตรวจฟรี
-            </Link>
-          </div>
-        </div>
-      </nav>
+      <NavBar />
 
       {/* Hero Section */}
       <section className="pt-32 pb-20 px-4">
@@ -296,7 +281,7 @@ export default function LandingPage() {
               <ul className="mt-6 space-y-3">
                 {[
                   'ตรวจเช็คไม่จำกัด',
-                  'ประวัติย้อนหลัง 30 วัน',
+                  'ประวัติย้อนหลัง 90 วัน',
                   'กราฟแนวโน้ม',
                   'แจ้งเตือนเช็กอิน',
                   'รายงาน PDF',
@@ -309,9 +294,12 @@ export default function LandingPage() {
                   </li>
                 ))}
               </ul>
-              <button className="mt-8 w-full py-3 bg-white text-violet-700 font-medium rounded-xl hover:bg-violet-50 transition-all">
-                เริ่มทดลองใช้ 7 วัน
-              </button>
+              <Link
+                href="/pricing"
+                className="mt-8 block w-full py-3 bg-white text-violet-700 font-medium rounded-xl hover:bg-violet-50 transition-all text-center"
+              >
+                สมัครเลย
+              </Link>
             </div>
 
             {/* Business Plan */}
@@ -336,9 +324,12 @@ export default function LandingPage() {
                   </li>
                 ))}
               </ul>
-              <button className="mt-8 w-full py-3 border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-all">
+              <Link
+                href="mailto:contact@mindcheck.app"
+                className="mt-8 block w-full py-3 border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-all text-center"
+              >
                 ติดต่อฝ่ายขาย
-              </button>
+              </Link>
             </div>
           </div>
         </div>

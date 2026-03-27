@@ -5,12 +5,14 @@
 
 'use client';
 
-import { useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import QuickCheckin, { CheckinResponse } from '@/components/QuickCheckin';
+import PHQ9Survey, { PHQ9Response } from '@/components/PHQ9Survey';
 import WellnessResult from '@/components/WellnessResult';
 import type { PHQ9Prediction } from '@/lib/phq9-predictor';
+import type { ScanDebugData } from '@/components/FaceScan';
 
 // Dynamic import to avoid SSR issues with MediaPipe
 const FaceScan = dynamic(() => import('@/components/FaceScan'), {
@@ -27,7 +29,12 @@ const FaceScan = dynamic(() => import('@/components/FaceScan'), {
 // Types
 // ============================================================================
 
-type FlowStep = 'checkin' | 'scanning' | 'result';
+type FlowStep = 'checkin' | 'scanning' | 'phq9' | 'result';
+type ScanCompleteEventDetail = {
+  prediction: PHQ9Prediction;
+  debug?: ScanDebugData;
+  timestamp: number;
+};
 
 // ============================================================================
 // Main Component
@@ -36,36 +43,118 @@ type FlowStep = 'checkin' | 'scanning' | 'result';
 export default function ScanPage() {
   const [step, setStep] = useState<FlowStep>('checkin');
   const [checkinResponse, setCheckinResponse] = useState<CheckinResponse | null>(null);
+  const [phq9Response, setPhq9Response] = useState<PHQ9Response | null>(null);
   const [prediction, setPrediction] = useState<PHQ9Prediction | null>(null);
   const [scanTimestamp, setScanTimestamp] = useState<number | null>(null);
+  const [scanDebugData, setScanDebugData] = useState<ScanDebugData | null>(null);
+  const scanCompletedRef = useRef(false);
+  const handleScanCompleteRef = useRef<(pred: PHQ9Prediction, debug?: ScanDebugData) => void>(() => {});
 
   const handleCheckinComplete = (response: CheckinResponse) => {
     setCheckinResponse(response);
     setStep('scanning');
   };
 
-  const handleScanComplete = (pred: PHQ9Prediction) => {
+  const handleScanComplete = (pred: PHQ9Prediction, debug?: ScanDebugData) => {
+    if (scanCompletedRef.current) return;
+    scanCompletedRef.current = true;
     setPrediction(pred);
     setScanTimestamp(Date.now()); // Record exact scan completion time
+    setScanDebugData(debug || null);
+    setStep('phq9');
+  };
+
+  useEffect(() => {
+    handleScanCompleteRef.current = handleScanComplete;
+  });
+
+  useEffect(() => {
+    if (step === 'scanning') {
+      scanCompletedRef.current = false;
+    }
+  }, [step]);
+
+  // Fallback: listen to scan-complete event if onComplete missed
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handler = (event: Event) => {
+      if (step !== 'scanning' || scanCompletedRef.current) return;
+      const detail = (event as CustomEvent<ScanCompleteEventDetail>).detail;
+      if (!detail?.prediction) return;
+      handleScanCompleteRef.current(detail.prediction, detail.debug);
+    };
+
+    window.addEventListener('facepsy:scan-complete', handler as EventListener);
+    return () => {
+      window.removeEventListener('facepsy:scan-complete', handler as EventListener);
+    };
+  }, [step]);
+
+  // Fallback: poll localStorage for last prediction (safety net)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (step !== 'scanning') return;
+
+    const checkStorage = () => {
+      try {
+        const raw = localStorage.getItem('facepsy_last_prediction');
+        if (!raw) return;
+        const parsed = JSON.parse(raw) as ScanCompleteEventDetail;
+        if (!parsed?.prediction) return;
+
+        // Use recent prediction only (within 5 minutes)
+        if (Date.now() - parsed.timestamp < 5 * 60 * 1000) {
+          localStorage.removeItem('facepsy_last_prediction');
+          handleScanCompleteRef.current(parsed.prediction, parsed.debug);
+        }
+      } catch {
+        // Ignore parsing/storage errors
+      }
+    };
+
+    checkStorage();
+    const intervalId = window.setInterval(checkStorage, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [step]);
+
+  // Restore last prediction after full reload (safety net)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = localStorage.getItem('facepsy_last_prediction');
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as ScanCompleteEventDetail;
+      if (!parsed?.prediction) return;
+      if (Date.now() - parsed.timestamp > 10 * 60 * 1000) return;
+      handleScanCompleteRef.current(parsed.prediction, parsed.debug);
+    } catch {
+      // Ignore parsing/storage errors
+    }
+  }, []);
+
+  const handlePHQ9Complete = (response: PHQ9Response) => {
+    setPhq9Response(response);
     setStep('result');
   };
 
   const handleReset = () => {
     setStep('checkin');
     setCheckinResponse(null);
+    setPhq9Response(null);
     setPrediction(null);
     setScanTimestamp(null);
+    setScanDebugData(null);
+    scanCompletedRef.current = false;
   };
 
-  const handleSaveHistory = () => {
-    // TODO: Implement save to backend/localStorage
-    alert('บันทึกประวัติเรียบร้อย');
-  };
-
-  const handleDownloadPDF = () => {
-    // TODO: Implement PDF generation
-    alert('ฟีเจอร์นี้จะเปิดให้ใช้งานเร็วๆ นี้');
-  };
+  const steps = [
+    { key: 'checkin', label: 'แบบสอบถาม' },
+    { key: 'scanning', label: 'สแกนหน้า' },
+    { key: 'phq9', label: 'PHQ-9' },
+    { key: 'result', label: 'ผลลัพธ์' },
+  ] as const;
+  const currentStepIndex = steps.findIndex(s => s.key === step);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white">
@@ -91,42 +180,28 @@ export default function ScanPage() {
       {/* Progress Steps */}
       <div className="max-w-md mx-auto px-4 pt-6">
         <div className="flex items-center justify-center gap-2">
-          <div className={`flex items-center gap-2 ${step === 'checkin' ? 'text-violet-600' : 'text-gray-400'}`}>
-            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
-              step === 'checkin' ? 'bg-violet-600 text-white' :
-              step === 'scanning' || step === 'result' ? 'bg-green-500 text-white' : 'bg-gray-200'
-            }`}>
-              {step === 'scanning' || step === 'result' ? '✓' : '1'}
-            </div>
-            <span className="text-sm hidden sm:inline">แบบสอบถาม</span>
-          </div>
+          {steps.map((s, idx) => (
+            <Fragment key={s.key}>
+              <div className={`flex items-center gap-2 ${idx === currentStepIndex ? 'text-violet-600' : idx < currentStepIndex ? 'text-violet-600' : 'text-gray-400'}`}>
+                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
+                  idx < currentStepIndex
+                    ? 'bg-green-500 text-white'
+                    : idx === currentStepIndex
+                      ? 'bg-violet-600 text-white'
+                      : 'bg-gray-200'
+                }`}>
+                  {idx < currentStepIndex ? '✓' : idx + 1}
+                </div>
+                <span className="text-sm hidden sm:inline">{s.label}</span>
+              </div>
 
-          <div className="w-8 h-0.5 bg-gray-200">
-            <div className={`h-full transition-all ${step === 'scanning' || step === 'result' ? 'bg-violet-600 w-full' : 'w-0'}`} />
-          </div>
-
-          <div className={`flex items-center gap-2 ${step === 'scanning' ? 'text-violet-600' : 'text-gray-400'}`}>
-            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
-              step === 'scanning' ? 'bg-violet-600 text-white' :
-              step === 'result' ? 'bg-green-500 text-white' : 'bg-gray-200'
-            }`}>
-              {step === 'result' ? '✓' : '2'}
-            </div>
-            <span className="text-sm hidden sm:inline">สแกนหน้า</span>
-          </div>
-
-          <div className="w-8 h-0.5 bg-gray-200">
-            <div className={`h-full transition-all ${step === 'result' ? 'bg-violet-600 w-full' : 'w-0'}`} />
-          </div>
-
-          <div className={`flex items-center gap-2 ${step === 'result' ? 'text-violet-600' : 'text-gray-400'}`}>
-            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
-              step === 'result' ? 'bg-violet-600 text-white' : 'bg-gray-200'
-            }`}>
-              3
-            </div>
-            <span className="text-sm hidden sm:inline">ผลลัพธ์</span>
-          </div>
+              {idx < steps.length - 1 && (
+                <div className="w-8 h-0.5 bg-gray-200">
+                  <div className={`h-full transition-all ${idx < currentStepIndex ? 'bg-violet-600 w-full' : 'w-0'}`} />
+                </div>
+              )}
+            </Fragment>
+          ))}
         </div>
       </div>
 
@@ -146,7 +221,13 @@ export default function ScanPage() {
               console.error('Scan error:', error);
               alert('เกิดข้อผิดพลาด: ' + error.message);
             }}
-            showDebugInfo={process.env.NODE_ENV === 'development'}
+          />
+        )}
+
+        {step === 'phq9' && (
+          <PHQ9Survey
+            onComplete={handlePHQ9Complete}
+            onBack={() => setStep('scanning')}
           />
         )}
 
@@ -154,10 +235,10 @@ export default function ScanPage() {
           <WellnessResult
             prediction={prediction}
             checkinResponse={checkinResponse || undefined}
+            phq9Response={phq9Response || undefined}
             onReset={handleReset}
-            onSaveHistory={handleSaveHistory}
-            onDownloadPDF={handleDownloadPDF}
             scanTimestamp={scanTimestamp || undefined}
+            debugData={scanDebugData || undefined}
           />
         )}
       </main>

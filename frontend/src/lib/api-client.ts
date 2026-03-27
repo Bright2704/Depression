@@ -1,10 +1,13 @@
 /**
  * API Client for FacePsy Backend
  * Handles encrypted transmission of facial metadata
+ * Now with real-time frame analysis using AU_200.tflite model
  */
 
-import type { WindowStatistics } from '@/hooks/useFacePsy';
-import type { PHQ9Prediction, UserBaseline, PredictionSession } from './phq9-predictor';
+import type { PHQ9Prediction, UserBaseline, PredictionSession, WindowStatistics } from './phq9-predictor';
+
+// Re-export WindowStatistics for convenience
+export type { WindowStatistics };
 
 // ============================================================================
 // Configuration
@@ -16,6 +19,84 @@ interface ApiResponse<T> {
   success: boolean;
   message: string;
   data: T | null;
+}
+
+// ============================================================================
+// Frame Analysis Types (from Backend AU_200.tflite model)
+// ============================================================================
+
+export interface ActionUnitResult {
+  'AU01 - Inner Brow Raiser': number;
+  'AU02 - Outer Brow Raiser': number;
+  'AU04 - Brow Lowerer': number;
+  'AU06 - Cheek Raiser': number;
+  'AU07 - Lid Tightener': number;
+  'AU10 - Upper Lip Raiser': number;
+  'AU12 - Lip Corner Puller': number;
+  'AU14 - Dimpler': number;
+  'AU15 - Lip Corner Depressor': number;
+  'AU17 - Chin Raiser': number;
+  'AU23 - Lip Tightener': number;
+  'AU24 - Lip Pressor': number;
+}
+
+export interface FrameAnalysisResult {
+  success: boolean;
+  message: string;
+  data: {
+    face_detected: boolean;
+    bounding_box: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    };
+    head_pose: {
+      pitch: number;
+      yaw: number;
+      roll: number;
+    } | null;
+    eye_analysis: {
+      left_eye_openness: number;
+      right_eye_openness: number;
+      average_openness: number;
+    };
+    expressions: {
+      smile_probability: number;
+      smile_details: {
+        from_blendshapes: number;
+        from_au12: number;
+        from_landmarks: number;
+      };
+    };
+    action_units: ActionUnitResult | null;
+    landmarks_count: number;
+  } | null;
+}
+
+// Simplified AU format for internal use
+export interface SimpleActionUnits {
+  AU01: number;
+  AU02: number;
+  AU04: number;
+  AU06: number;
+  AU07: number;
+  AU10: number;
+  AU12: number;
+  AU14: number;
+  AU15: number;
+  AU17: number;
+  AU23: number;
+  AU24: number;
+}
+
+export interface ParsedFrameResult {
+  faceDetected: boolean;
+  headPose: { pitch: number; yaw: number; roll: number };
+  actionUnits: SimpleActionUnits;
+  eyeOpenness: number;
+  smileProbability: number;
+  timestamp: number;
 }
 
 // ============================================================================
@@ -61,22 +142,28 @@ export interface DashboardData {
 
 class FacePsyApiClient {
   private baseUrl: string;
-  private authToken: string | null = null;
+  private isBackendAvailable: boolean | null = null;
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
   }
 
   // =========================================================================
-  // Auth Methods
+  // Auth Methods - Now reads from localStorage/zustand store
   // =========================================================================
 
-  setAuthToken(token: string) {
-    this.authToken = token;
-  }
-
-  clearAuthToken() {
-    this.authToken = null;
+  private getAuthToken(): string | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      const stored = localStorage.getItem('mindcheck-auth');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return parsed?.state?.accessToken || null;
+      }
+    } catch {
+      // Ignore errors
+    }
+    return null;
   }
 
   private getHeaders(): HeadersInit {
@@ -84,11 +171,241 @@ class FacePsyApiClient {
       'Content-Type': 'application/json',
     };
 
-    if (this.authToken) {
-      headers['Authorization'] = `Bearer ${this.authToken}`;
+    const token = this.getAuthToken();
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
     }
 
     return headers;
+  }
+
+  // =========================================================================
+  // Real-time Frame Analysis (Uses AU_200.tflite model on backend)
+  // =========================================================================
+
+  /**
+   * Check if backend is available and has model loaded
+   * Always re-checks to ensure we have the latest status
+   */
+  async checkBackendStatus(): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout
+
+      const response = await fetch(`${this.baseUrl}/`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const data = await response.json();
+        this.isBackendAvailable = data.model_loaded === true && data.face_landmarker_loaded === true;
+        console.log('✅ Backend status:', data);
+        return this.isBackendAvailable;
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.warn('⚠️ Backend check timeout');
+      } else {
+        console.warn('⚠️ Backend not available:', error);
+      }
+    }
+
+    this.isBackendAvailable = false;
+    return false;
+  }
+
+  /**
+   * Reset cached backend status (call this to force re-check)
+   */
+  resetBackendStatus(): void {
+    this.isBackendAvailable = null;
+  }
+
+  /**
+   * Analyze a single frame using the backend AU_200.tflite model
+   * This provides the most accurate Action Unit detection
+   */
+  async analyzeFrame(base64Image: string): Promise<ParsedFrameResult | null> {
+    try {
+      const response = await fetch(`${this.baseUrl}/analyze-base64`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: base64Image }),
+      });
+
+      if (!response.ok) {
+        console.error('Backend analysis failed:', response.status);
+        return null;
+      }
+
+      const result: FrameAnalysisResult = await response.json();
+
+      if (!result.success || !result.data?.face_detected) {
+        return {
+          faceDetected: false,
+          headPose: { pitch: 0, yaw: 0, roll: 0 },
+          actionUnits: this.getEmptyActionUnits(),
+          eyeOpenness: 0.5,
+          smileProbability: 0,
+          timestamp: Date.now(),
+        };
+      }
+
+      // Parse the action units from backend format to simple format
+      const actionUnits = this.parseActionUnits(result.data.action_units);
+
+      return {
+        faceDetected: true,
+        headPose: result.data.head_pose || { pitch: 0, yaw: 0, roll: 0 },
+        actionUnits,
+        eyeOpenness: result.data.eye_analysis.average_openness,
+        smileProbability: result.data.expressions.smile_probability,
+        timestamp: Date.now(),
+      };
+    } catch (error) {
+      console.error('Frame analysis error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Capture frame from video element as base64
+   */
+  captureFrameAsBase64(video: HTMLVideoElement): string | null {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+
+      // Draw video frame (flip horizontally for selfie camera)
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, 0, 0);
+
+      // Convert to base64 JPEG (smaller size)
+      return canvas.toDataURL('image/jpeg', 0.8);
+    } catch (error) {
+      console.error('Frame capture error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Parse backend AU format to simple format
+   */
+  private parseActionUnits(auResult: ActionUnitResult | null): SimpleActionUnits {
+    if (!auResult) {
+      return this.getEmptyActionUnits();
+    }
+
+    return {
+      AU01: auResult['AU01 - Inner Brow Raiser'] || 0,
+      AU02: auResult['AU02 - Outer Brow Raiser'] || 0,
+      AU04: auResult['AU04 - Brow Lowerer'] || 0,
+      AU06: auResult['AU06 - Cheek Raiser'] || 0,
+      AU07: auResult['AU07 - Lid Tightener'] || 0,
+      AU10: auResult['AU10 - Upper Lip Raiser'] || 0,
+      AU12: auResult['AU12 - Lip Corner Puller'] || 0,
+      AU14: auResult['AU14 - Dimpler'] || 0,
+      AU15: auResult['AU15 - Lip Corner Depressor'] || 0,
+      AU17: auResult['AU17 - Chin Raiser'] || 0,
+      AU23: auResult['AU23 - Lip Tightener'] || 0,
+      AU24: auResult['AU24 - Lip Pressor'] || 0,
+    };
+  }
+
+  private getEmptyActionUnits(): SimpleActionUnits {
+    return {
+      AU01: 0, AU02: 0, AU04: 0, AU06: 0, AU07: 0, AU10: 0,
+      AU12: 0, AU14: 0, AU15: 0, AU17: 0, AU23: 0, AU24: 0,
+    };
+  }
+
+  /**
+   * Calculate window statistics from multiple frame results
+   */
+  calculateWindowStats(frames: ParsedFrameResult[]): WindowStatistics {
+    const validFrames = frames.filter(f => f.faceDetected);
+
+    if (validFrames.length === 0) {
+      return this.getEmptyWindowStats();
+    }
+
+    const mean = (arr: number[]) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+    const std = (arr: number[]) => {
+      if (arr.length === 0) return 0;
+      const m = mean(arr);
+      return Math.sqrt(arr.reduce((acc, val) => acc + Math.pow(val - m, 2), 0) / arr.length);
+    };
+    const range = (arr: number[]) => arr.length > 0 ? Math.max(...arr) - Math.min(...arr) : 0;
+
+    const pitchValues = validFrames.map(f => f.headPose.pitch);
+    const yawValues = validFrames.map(f => f.headPose.yaw);
+    const rollValues = validFrames.map(f => f.headPose.roll);
+    const smileValues = validFrames.map(f => f.smileProbability);
+    const earValues = validFrames.map(f => f.eyeOpenness);
+
+    // Count blinks (when eye openness drops below threshold)
+    let blinkCount = 0;
+    for (let i = 1; i < validFrames.length; i++) {
+      if (validFrames[i - 1].eyeOpenness > 0.3 && validFrames[i].eyeOpenness < 0.2) {
+        blinkCount++;
+      }
+    }
+    const durationMinutes = (validFrames[validFrames.length - 1].timestamp - validFrames[0].timestamp) / 60000 || 1/6;
+    const blinkRate = Math.round(blinkCount / durationMinutes);
+
+    // Calculate AU statistics
+    const auKeys: (keyof SimpleActionUnits)[] = ['AU01', 'AU02', 'AU04', 'AU06', 'AU07', 'AU10', 'AU12', 'AU14', 'AU15', 'AU17', 'AU23', 'AU24'];
+    const actionUnits: { [key: string]: { mean: number; std: number } } = {};
+
+    for (const key of auKeys) {
+      const values = validFrames.map(f => f.actionUnits[key]);
+      actionUnits[key] = {
+        mean: mean(values),
+        std: std(values),
+      };
+    }
+
+    return {
+      windowStart: validFrames[0]?.timestamp || Date.now(),
+      windowEnd: validFrames[validFrames.length - 1]?.timestamp || Date.now(),
+      frameCount: validFrames.length,
+      headPose: {
+        pitch: { mean: mean(pitchValues), std: std(pitchValues), range: range(pitchValues) },
+        yaw: { mean: mean(yawValues), std: std(yawValues), range: range(yawValues) },
+        roll: { mean: mean(rollValues), std: std(rollValues), range: range(rollValues) },
+      },
+      eyeMetrics: {
+        blinkRate,
+        avgEAR: { mean: mean(earValues), std: std(earValues) },
+      },
+      actionUnits,
+      smileProbability: { mean: mean(smileValues), std: std(smileValues) },
+    };
+  }
+
+  private getEmptyWindowStats(): WindowStatistics {
+    return {
+      windowStart: Date.now(),
+      windowEnd: Date.now(),
+      frameCount: 0,
+      headPose: {
+        pitch: { mean: 0, std: 0, range: 0 },
+        yaw: { mean: 0, std: 0, range: 0 },
+        roll: { mean: 0, std: 0, range: 0 },
+      },
+      eyeMetrics: { blinkRate: 15, avgEAR: { mean: 0.28, std: 0.02 } },
+      actionUnits: {},
+      smileProbability: { mean: 0, std: 0 },
+    };
   }
 
   // =========================================================================

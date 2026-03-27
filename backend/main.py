@@ -3,6 +3,8 @@ FacePsy Web Backend
 - Face detection using MediaPipe Tasks API
 - Action Unit detection using TFLite model
 - Depression-related facial feature extraction
+- Authentication (JWT + OAuth)
+- Admin Dashboard
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -16,33 +18,50 @@ import base64
 import os
 import urllib.request
 
+# Import routers
+from .auth.router import router as auth_router
+from .admin.router import router as admin_router
+from .users.router import router as users_router
+from .scans.router import router as scans_router
+from .payments.router import router as payments_router
+from .config import settings
+
 # Try to import tflite (optional - AU detection will be disabled if not available)
 tflite = None
 try:
     import tflite_runtime.interpreter as tflite_module
     tflite = tflite_module
-except ImportError:
+except Exception:
     try:
         import tensorflow.lite as tflite_module
         tflite = tflite_module
-    except ImportError:
+    except Exception as e:
         print("Warning: TFLite not available. AU detection will be disabled.")
+        print(f"TFLite import error: {e}")
 
 # MediaPipe Tasks API
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-app = FastAPI(title="FacePsy Web API", version="1.0.0")
+app = FastAPI(title="MindCheck API", version="2.0.0")
 
 # CORS for Next.js frontend
+cors_origins = settings.CORS_ORIGINS + ["https://0926-223-205-251-188.ngrok-free.app"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "https://0926-223-205-251-188.ngrok-free.app"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include routers
+app.include_router(auth_router)
+app.include_router(admin_router)
+app.include_router(users_router)
+app.include_router(scans_router)
+app.include_router(payments_router)
 
 # Model paths
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
@@ -178,8 +197,8 @@ def preprocess_face_for_au(face_image):
     # Normalize
     normalized = (resized.astype(np.float32) - 128.0) / 128.0
 
-    # Add batch and channel dimensions
-    input_data = np.expand_dims(np.expand_dims(normalized, axis=0), axis=-1)
+    # Add batch and channel dimensions (model expects NCHW: [1, 1, 200, 200])
+    input_data = np.expand_dims(np.expand_dims(normalized, axis=0), axis=0)
 
     return input_data
 
@@ -206,11 +225,16 @@ def detect_action_units(face_image):
 
         # Get output
         output_data = interpreter.get_tensor(output_details[0]['index'])
+        values = output_data[0] if output_data.ndim > 1 else output_data
+
+        # If model outputs logits or out-of-range values, apply sigmoid
+        if np.min(values) < 0 or np.max(values) > 1:
+            values = 1 / (1 + np.exp(-values))
 
         # Create AU results
         au_results = {}
         for i, name in enumerate(AU_NAMES):
-            au_results[name] = float(output_data[0][i]) if i < len(output_data[0]) else 0.0
+            au_results[name] = float(values[i]) if i < len(values) else 0.0
 
         return au_results
     except Exception as e:
