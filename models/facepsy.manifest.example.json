@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "description": "คัดลอกเป็น facepsy.manifest.json และแก้ path/shape ให้ตรงกับโมเดลที่ export",
+  "auOnnx": {
+    "modelFile": "au.onnx",
+    "inputName": "input",
+    "inputShape": [1, 1434],
+    "outputName": "output",
+    "outputDim": 12,
+    "notes": "478 landmarks x,y,z = 1434 floats หากโมเดลคาด shape อื่นให้แก้ที่นี่และใน preprocess"
+  }
+}

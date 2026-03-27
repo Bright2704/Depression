@@ -8,8 +8,8 @@ services:
       - "8000:8000"
   frontend:
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend/Dockerfile
       args:
         NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
@@ -66,5 +66,21 @@ services:
       mysql:
         condition: service_healthy
 
+  training-worker:
+    build:
+      context: ./training
+      dockerfile: Dockerfile.worker
+    platform: linux/amd64
+    environment:
+      DATABASE_URL: mysql+pymysql://mindcheck:${MYSQL_PASSWORD:-mindcheck_password}@mysql:3306/mindcheck
+      USER_DATA_DIR: /app/user_data
+    volumes:
+      - user_training_data:/app/user_data
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   mysql_data:
+  user_training_data:

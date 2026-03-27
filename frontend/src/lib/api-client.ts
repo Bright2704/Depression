@@ -120,6 +120,11 @@ export interface SessionHistoryItem {
   confidence: number;
 }
 
+export interface WellnessSettings {
+  shareVectors: boolean;
+  sharePhq9: boolean;
+}
+
 export interface DashboardData {
   weeklyTrend: {
     date: string;
@@ -585,6 +590,125 @@ class FacePsyApiClient {
       }
 
       return await response.json();
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Unknown error',
+        data: null,
+      };
+    }
+  }
+
+  async getWellnessSettings(): Promise<ApiResponse<WellnessSettings>> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/wellness/settings`, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      });
+      if (!response.ok) {
+        return { success: false, message: `API error: ${response.status}`, data: null };
+      }
+      const raw = await response.json();
+      return {
+        success: true,
+        message: 'OK',
+        data: {
+          shareVectors: !!raw.share_vectors,
+          sharePhq9: !!raw.share_phq9,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Unknown error',
+        data: null,
+      };
+    }
+  }
+
+  async putWellnessSettings(body: {
+    shareVectors: boolean;
+    sharePhq9: boolean;
+  }): Promise<ApiResponse<WellnessSettings>> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/wellness/settings`, {
+        method: 'PUT',
+        headers: this.getHeaders(),
+        body: JSON.stringify({
+          share_vectors: body.shareVectors,
+          share_phq9: body.sharePhq9,
+        }),
+      });
+      if (!response.ok) {
+        return { success: false, message: `API error: ${response.status}`, data: null };
+      }
+      const raw = await response.json();
+      return {
+        success: true,
+        message: 'OK',
+        data: {
+          shareVectors: !!raw.share_vectors,
+          sharePhq9: !!raw.share_phq9,
+        },
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Unknown error',
+        data: null,
+      };
+    }
+  }
+
+  async submitVectorSample(payload: {
+    vector: number[];
+    dim: number;
+    timeEpoch?: string;
+    sessionId?: string;
+  }): Promise<ApiResponse<{ id: string }>> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/wellness/vector-sample`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({
+          vector: payload.vector,
+          dim: payload.dim,
+          time_epoch: payload.timeEpoch,
+          session_id: payload.sessionId,
+        }),
+      });
+      if (!response.ok) {
+        return { success: false, message: `API error: ${response.status}`, data: null };
+      }
+      const raw = await response.json();
+      return { success: true, message: 'OK', data: { id: raw.id } };
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Unknown error',
+        data: null,
+      };
+    }
+  }
+
+  async submitPhq9Label(payload: {
+    totalScore: number;
+    answers?: number[];
+  }): Promise<ApiResponse<{ id: string }>> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/wellness/phq9-label`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify({
+          total_score: payload.totalScore,
+          answers: payload.answers,
+        }),
+      });
+      if (!response.ok) {
+        return { success: false, message: `API error: ${response.status}`, data: null };
+      }
+      const raw = await response.json();
+      return { success: true, message: 'OK', data: { id: raw.id } };
     } catch (error) {
       return {
         success: false,

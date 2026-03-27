@@ -1,54 +1,18 @@
 /**
  * FacePsy React Hook
- * Extracts facial features using MediaPipe Face Mesh for depression screening
+ * Extracts facial features using MediaPipe Face Landmarker (+ optional FacePsy ONNX AU) for screening
  * Based on FacePsy research paper: 151 signals including AUs, EAR, Head Pose
  *
  * Privacy-first: All processing happens in browser, only numeric metadata sent to backend
  */
 
 import { useRef, useState, useCallback, useEffect } from 'react';
+import type { HeadPose, EyeMetrics, ActionUnits, GeometricFeatures } from '@/lib/facepsy-types';
+import { loadFacePsyManifest } from '@/lib/facepsy-manifest';
+import { FacePsyOnnxAu, mergeActionUnits } from '@/lib/facepsy-onnx-au';
+import { blendshapesToActionUnits } from '@/lib/facepsy-blendshape-au';
 
-// ============================================================================
-// Types & Interfaces
-// ============================================================================
-
-export interface HeadPose {
-  pitch: number;  // Up/Down rotation (nodding)
-  yaw: number;    // Left/Right rotation (shaking head)
-  roll: number;   // Tilting head
-}
-
-export interface EyeMetrics {
-  leftEAR: number;        // Left Eye Aspect Ratio
-  rightEAR: number;       // Right Eye Aspect Ratio
-  averageEAR: number;     // Average EAR
-  leftOpenProbability: number;
-  rightOpenProbability: number;
-  blinkDetected: boolean;
-}
-
-export interface ActionUnits {
-  AU01: number;  // Inner Brow Raiser
-  AU02: number;  // Outer Brow Raiser (key predictor)
-  AU04: number;  // Brow Lowerer
-  AU06: number;  // Cheek Raiser (key predictor)
-  AU07: number;  // Lid Tightener (key predictor)
-  AU10: number;  // Upper Lip Raiser
-  AU12: number;  // Lip Corner Puller (key predictor)
-  AU14: number;  // Dimpler
-  AU15: number;  // Lip Corner Depressor (key predictor)
-  AU17: number;  // Chin Raiser (key predictor)
-  AU23: number;  // Lip Tightener
-  AU24: number;  // Lip Pressor
-}
-
-export interface GeometricFeatures {
-  mouthAspectRatio: number;
-  mouthWidth: number;
-  eyebrowHeight: number;
-  facialSymmetry: number;
-  interVectorAngles: number[];  // IVA features
-}
+export type { HeadPose, EyeMetrics, ActionUnits, GeometricFeatures } from '@/lib/facepsy-types';
 
 export interface FacialFrame {
   timestamp: number;
@@ -100,7 +64,7 @@ export interface FacePsyState {
 }
 
 // ============================================================================
-// Landmark Indices (MediaPipe Face Mesh 468 points)
+// Landmark indices (เข้ากันได้กับ topology 468/478 ของ MediaPipe face landmarks)
 // ============================================================================
 
 const LANDMARK_INDICES = {
@@ -393,6 +357,31 @@ function calculateSmileProbability(actionUnits: ActionUnits): number {
   return clamp(duchenne - inhibitor, 0, 1);
 }
 
+/** Euler จาก 4x4 row-major (MediaPipe facialTransformationMatrixes) */
+function headPoseFromMatrix4(m: Float32Array | number[]): HeadPose {
+  const a = Array.from(m);
+  if (a.length < 16) return { pitch: 0, yaw: 0, roll: 0 };
+  const sy = Math.sqrt(a[0] * a[0] + a[4] * a[4]);
+  const singular = sy < 1e-6;
+  let x: number;
+  let y: number;
+  let z: number;
+  if (!singular) {
+    x = Math.atan2(a[9], a[10]);
+    y = Math.atan2(-a[8], sy);
+    z = Math.atan2(a[4], a[0]);
+  } else {
+    x = Math.atan2(-a[7], a[8]);
+    y = Math.atan2(-a[8], sy);
+    z = 0;
+  }
+  return {
+    pitch: clamp((x * 180) / Math.PI, -90, 90),
+    yaw: clamp((y * 180) / Math.PI, -90, 90),
+    roll: clamp((z * 180) / Math.PI, -90, 90),
+  };
+}
+
 // ============================================================================
 // Main Hook
 // ============================================================================
@@ -418,7 +407,9 @@ export function useFacePsy(config: Partial<FacePsyConfig> = {}) {
     fps: 0,
   });
 
-  const faceMeshRef = useRef<any>(null);
+  const faceLandmarkerRef = useRef<{ detectForVideo: (v: HTMLVideoElement, t: number) => unknown; close?: () => void } | null>(null);
+  const onnxAuRef = useRef<FacePsyOnnxAu | null>(null);
+  const cameraRef = useRef<{ stop: () => void } | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameBufferRef = useRef<FacialFrame[]>([]);
@@ -427,149 +418,6 @@ export function useFacePsy(config: Partial<FacePsyConfig> = {}) {
   const fpsCounterRef = useRef<number[]>([]);
   const blinkHistoryRef = useRef<{ timestamp: number; detected: boolean }[]>([]);
 
-  // Initialize MediaPipe Face Mesh
-  const initialize = useCallback(async (video: HTMLVideoElement, canvas: HTMLCanvasElement) => {
-    try {
-      videoRef.current = video;
-      canvasRef.current = canvas;
-
-      // Dynamic import to avoid SSR issues
-      const { FaceMesh } = await import('@mediapipe/face_mesh');
-      const { Camera } = await import('@mediapipe/camera_utils');
-
-      const faceMesh = new FaceMesh({
-        locateFile: (file: string) =>
-          `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`,
-      });
-
-      faceMesh.setOptions({
-        maxNumFaces: 1,
-        refineLandmarks: true,
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5,
-      });
-
-      faceMesh.onResults(processResults);
-      faceMeshRef.current = faceMesh;
-
-      // Initialize camera
-      const camera = new Camera(video, {
-        onFrame: async () => {
-          if (faceMeshRef.current) {
-            await faceMeshRef.current.send({ image: video });
-          }
-        },
-        width: 640,
-        height: 480,
-      });
-
-      await camera.start();
-
-      setState(prev => ({ ...prev, isInitialized: true, error: null }));
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to initialize MediaPipe';
-      setState(prev => ({ ...prev, error: errorMessage }));
-      onError?.(error instanceof Error ? error : new Error(errorMessage));
-    }
-  }, [onError]);
-
-  // Process MediaPipe results
-  const processResults = useCallback((results: any) => {
-    if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
-      return;
-    }
-
-    const now = performance.now();
-    const timeSinceLastFrame = now - lastFrameTimeRef.current;
-    const targetInterval = 1000 / samplingRate;
-
-    // Throttle to target sampling rate (2.5 FPS as per paper)
-    if (timeSinceLastFrame < targetInterval) {
-      return;
-    }
-
-    // Update FPS counter
-    fpsCounterRef.current.push(now);
-    fpsCounterRef.current = fpsCounterRef.current.filter(t => now - t < 1000);
-
-    const faceLandmarks = results.multiFaceLandmarks[0];
-    const width = videoRef.current?.videoWidth || 640;
-    const height = videoRef.current?.videoHeight || 480;
-
-    // Extract landmarks as array
-    const landmarks = extractLandmarkArray(faceLandmarks, width, height);
-
-    // Calculate face dimensions for normalization
-    const faceWidth = distance2D(
-      landmarks[LANDMARK_INDICES.leftCheek],
-      landmarks[LANDMARK_INDICES.rightCheek]
-    );
-    const faceHeight = distance2D(
-      landmarks[LANDMARK_INDICES.forehead],
-      landmarks[LANDMARK_INDICES.chin]
-    );
-
-    // Extract all features
-    const headPose = calculateHeadPose(landmarks);
-    const actionUnits = calculateActionUnits(landmarks, faceWidth, faceHeight);
-
-    const leftEAR = calculateEyeAspectRatio(landmarks, true);
-    const rightEAR = calculateEyeAspectRatio(landmarks, false);
-    const averageEAR = (leftEAR + rightEAR) / 2;
-    const blinkDetected = averageEAR < 0.2;
-
-    // Track blinks for blink rate calculation
-    blinkHistoryRef.current.push({ timestamp: now, detected: blinkDetected });
-    blinkHistoryRef.current = blinkHistoryRef.current.filter(b => now - b.timestamp < 60000);
-
-    const eyeMetrics: EyeMetrics = {
-      leftEAR,
-      rightEAR,
-      averageEAR,
-      leftOpenProbability: clamp(leftEAR / 0.3, 0, 1),
-      rightOpenProbability: clamp(rightEAR / 0.3, 0, 1),
-      blinkDetected,
-    };
-
-    const geometricFeatures = calculateGeometricFeatures(landmarks, faceWidth, faceHeight);
-    const smileProbability = calculateSmileProbability(actionUnits);
-
-    const frame: FacialFrame = {
-      timestamp: now,
-      headPose,
-      eyeMetrics,
-      actionUnits,
-      geometricFeatures,
-      smileProbability,
-      landmarks: enableDebugLandmarks ? landmarks : undefined,
-    };
-
-    // Add to buffer
-    frameBufferRef.current.push(frame);
-
-    // Calculate window statistics when window is complete
-    const windowStart = frameBufferRef.current[0]?.timestamp || now;
-    if (now - windowStart >= windowDuration) {
-      const stats = calculateWindowStatistics(frameBufferRef.current);
-      frameBufferRef.current = [];  // Clear buffer
-
-      setState(prev => ({ ...prev, windowStats: stats }));
-      onWindowComplete?.(stats);
-    }
-
-    // Update state
-    lastFrameTimeRef.current = now;
-    setState(prev => ({
-      ...prev,
-      currentFrame: frame,
-      frameCount: prev.frameCount + 1,
-      fps: fpsCounterRef.current.length,
-    }));
-
-    onFrameProcessed?.(frame);
-  }, [samplingRate, windowDuration, enableDebugLandmarks, onFrameProcessed, onWindowComplete]);
-
-  // Calculate statistics over a time window
   const calculateWindowStatistics = useCallback((frames: FacialFrame[]): WindowStatistics => {
     if (frames.length === 0) {
       return {
@@ -590,26 +438,26 @@ export function useFacePsy(config: Partial<FacePsyConfig> = {}) {
       };
     }
 
-    const pitches = frames.map(f => f.headPose.pitch);
-    const yaws = frames.map(f => f.headPose.yaw);
-    const rolls = frames.map(f => f.headPose.roll);
-    const ears = frames.map(f => f.eyeMetrics.averageEAR);
-    const smiles = frames.map(f => f.smileProbability);
+    const pitches = frames.map((f) => f.headPose.pitch);
+    const yaws = frames.map((f) => f.headPose.yaw);
+    const rolls = frames.map((f) => f.headPose.roll);
+    const ears = frames.map((f) => f.eyeMetrics.averageEAR);
+    const smiles = frames.map((f) => f.smileProbability);
 
-    // Count blinks in window
     const blinksInWindow = blinkHistoryRef.current.filter(
-      b => b.timestamp >= frames[0].timestamp &&
-           b.timestamp <= frames[frames.length - 1].timestamp &&
-           b.detected
+      (b) =>
+        b.timestamp >= frames[0].timestamp &&
+        b.timestamp <= frames[frames.length - 1].timestamp &&
+        b.detected
     ).length;
-    const windowDurationMinutes = (frames[frames.length - 1].timestamp - frames[0].timestamp) / 60000;
+    const windowDurationMinutes =
+      (frames[frames.length - 1].timestamp - frames[0].timestamp) / 60000;
     const blinkRate = windowDurationMinutes > 0 ? blinksInWindow / windowDurationMinutes : 0;
 
-    // Calculate AU statistics
     const auStats: { [key: string]: { mean: number; std: number } } = {};
     const auKeys = Object.keys(frames[0].actionUnits) as (keyof ActionUnits)[];
     for (const key of auKeys) {
-      const values = frames.map(f => f.actionUnits[key]);
+      const values = frames.map((f) => f.actionUnits[key]);
       auStats[key] = { mean: mean(values), std: std(values) };
     }
 
@@ -630,6 +478,191 @@ export function useFacePsy(config: Partial<FacePsyConfig> = {}) {
       smileProbability: { mean: mean(smiles), std: std(smiles) },
     };
   }, []);
+
+  const processLandmarkerResults = useCallback(
+    async (results: {
+      faceLandmarks?: { x: number; y: number; z: number }[][];
+      faceBlendshapes?: { categories?: { categoryName?: string; score?: number }[] }[];
+      facialTransformationMatrixes?: (Float32Array | number[])[];
+    }) => {
+      if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+        return;
+      }
+
+      const now = performance.now();
+      const timeSinceLastFrame = now - lastFrameTimeRef.current;
+      const targetInterval = 1000 / samplingRate;
+
+      if (timeSinceLastFrame < targetInterval) {
+        return;
+      }
+
+      fpsCounterRef.current.push(now);
+      fpsCounterRef.current = fpsCounterRef.current.filter((t) => now - t < 1000);
+
+      const faceLandmarksNorm = results.faceLandmarks[0];
+      const width = videoRef.current?.videoWidth || 640;
+      const height = videoRef.current?.videoHeight || 480;
+
+      const landmarks = extractLandmarkArray(faceLandmarksNorm, width, height);
+
+      const faceWidth = distance2D(
+        landmarks[LANDMARK_INDICES.leftCheek],
+        landmarks[LANDMARK_INDICES.rightCheek]
+      );
+      const faceHeight = distance2D(
+        landmarks[LANDMARK_INDICES.forehead],
+        landmarks[LANDMARK_INDICES.chin]
+      );
+
+      let headPose: HeadPose;
+      const matrix = results.facialTransformationMatrixes?.[0];
+      if (matrix && (matrix as Float32Array).length >= 16) {
+        headPose = headPoseFromMatrix4(matrix as Float32Array);
+      } else if (Array.isArray(matrix) && matrix.length >= 16) {
+        headPose = headPoseFromMatrix4(matrix);
+      } else {
+        headPose = calculateHeadPose(landmarks);
+      }
+
+      const categories = results.faceBlendshapes?.[0]?.categories || [];
+      let actionUnits: ActionUnits;
+
+      if (onnxAuRef.current) {
+        const patch = await onnxAuRef.current.infer(faceLandmarksNorm);
+        actionUnits = mergeActionUnits(calculateActionUnits(landmarks, faceWidth, faceHeight), patch);
+      } else if (categories.length > 0) {
+        actionUnits = blendshapesToActionUnits(categories);
+      } else {
+        actionUnits = calculateActionUnits(landmarks, faceWidth, faceHeight);
+      }
+
+      const leftEAR = calculateEyeAspectRatio(landmarks, true);
+      const rightEAR = calculateEyeAspectRatio(landmarks, false);
+      const averageEAR = (leftEAR + rightEAR) / 2;
+      const blinkDetected = averageEAR < 0.2;
+
+      blinkHistoryRef.current.push({ timestamp: now, detected: blinkDetected });
+      blinkHistoryRef.current = blinkHistoryRef.current.filter((b) => now - b.timestamp < 60000);
+
+      const eyeMetrics: EyeMetrics = {
+        leftEAR,
+        rightEAR,
+        averageEAR,
+        leftOpenProbability: clamp(leftEAR / 0.3, 0, 1),
+        rightOpenProbability: clamp(rightEAR / 0.3, 0, 1),
+        blinkDetected,
+      };
+
+      const geometricFeatures = calculateGeometricFeatures(landmarks, faceWidth, faceHeight);
+      const smileProbability = calculateSmileProbability(actionUnits);
+
+      const frame: FacialFrame = {
+        timestamp: now,
+        headPose,
+        eyeMetrics,
+        actionUnits,
+        geometricFeatures,
+        smileProbability,
+        landmarks: enableDebugLandmarks ? landmarks : undefined,
+      };
+
+      frameBufferRef.current.push(frame);
+
+      const windowStart = frameBufferRef.current[0]?.timestamp || now;
+      if (now - windowStart >= windowDuration) {
+        const stats = calculateWindowStatistics(frameBufferRef.current);
+        frameBufferRef.current = [];
+
+        setState((prev) => ({ ...prev, windowStats: stats }));
+        onWindowComplete?.(stats);
+      }
+
+      lastFrameTimeRef.current = now;
+      setState((prev) => ({
+        ...prev,
+        currentFrame: frame,
+        frameCount: prev.frameCount + 1,
+        fps: fpsCounterRef.current.length,
+      }));
+
+      onFrameProcessed?.(frame);
+    },
+    [
+      samplingRate,
+      windowDuration,
+      enableDebugLandmarks,
+      onFrameProcessed,
+      onWindowComplete,
+      calculateWindowStatistics,
+    ]
+  );
+
+  // Initialize MediaPipe Face Landmarker + optional FacePsy ONNX AU
+  const initialize = useCallback(
+    async (video: HTMLVideoElement, canvas: HTMLCanvasElement) => {
+      try {
+        videoRef.current = video;
+        canvasRef.current = canvas;
+
+        const manifest = await loadFacePsyManifest();
+        onnxAuRef.current = await FacePsyOnnxAu.create(manifest);
+
+        const { FaceLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
+        const { Camera } = await import('@mediapipe/camera_utils');
+
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm'
+        );
+
+        let modelAssetPath =
+          'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+        try {
+          const head = await fetch('/models/facepsy/face_landmarker.task', { method: 'HEAD' });
+          if (head.ok) modelAssetPath = '/models/facepsy/face_landmarker.task';
+        } catch {
+          /* ใช้ CDN */
+        }
+
+        const faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath,
+            delegate: 'GPU',
+          },
+          outputFaceBlendshapes: true,
+          outputFacialTransformationMatrixes: true,
+          runningMode: 'VIDEO',
+          numFaces: 1,
+        });
+
+        faceLandmarkerRef.current = faceLandmarker;
+
+        const camera = new Camera(video, {
+          onFrame: async () => {
+            if (faceLandmarkerRef.current && videoRef.current) {
+              const r = faceLandmarkerRef.current.detectForVideo(
+                videoRef.current,
+                performance.now()
+              ) as Parameters<typeof processLandmarkerResults>[0];
+              await processLandmarkerResults(r);
+            }
+          },
+          width: 640,
+          height: 480,
+        });
+
+        await camera.start();
+        cameraRef.current = camera;
+
+        setState((prev) => ({ ...prev, isInitialized: true, error: null }));
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Failed to initialize MediaPipe';
+        setState((prev) => ({ ...prev, error: errorMessage }));
+        onError?.(error instanceof Error ? error : new Error(errorMessage));
+      }
+    },
+    [onError, processLandmarkerResults]
+  );
 
   // Start processing
   const startProcessing = useCallback(() => {
@@ -665,9 +698,17 @@ export function useFacePsy(config: Partial<FacePsyConfig> = {}) {
       if (processingIntervalRef.current) {
         clearInterval(processingIntervalRef.current);
       }
-      if (faceMeshRef.current) {
-        faceMeshRef.current.close();
+      try {
+        cameraRef.current?.stop();
+      } catch {
+        /* ignore */
       }
+      try {
+        faceLandmarkerRef.current?.close?.();
+      } catch {
+        /* ignore */
+      }
+      onnxAuRef.current?.dispose();
     };
   }, []);
 

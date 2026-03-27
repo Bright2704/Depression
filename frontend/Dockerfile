@@ -1,26 +1,20 @@
-# Frontend Dockerfile for Next.js
+# Frontend Dockerfile — build context ต้องเป็น root ของ repo (ดู docker-compose)
 FROM node:18-alpine
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* ./
-
-# Install dependencies
+COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
 
-# Copy source files
-COPY . .
+# โมเดลจาก repo root (ว่างได้) + ซอร์ส frontend
+COPY models ./models
+COPY frontend/ ./
 
-# Build-time public envs for Next.js
 ARG NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 
-# Build the application
 RUN npm run build
 
-# Expose port
 EXPOSE 3000
 
-# Start the application
 CMD ["npm", "start"]

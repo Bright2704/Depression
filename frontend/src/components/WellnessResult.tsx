@@ -17,6 +17,12 @@ import type { CheckinResponse } from './QuickCheckin';
 import type { PHQ9Response } from '@/components/PHQ9Survey';
 import { useAuthStore } from '@/stores/auth-store';
 import { authClient } from '@/lib/auth-client';
+import {
+  buildPersonalizedRecommendations,
+  deriveUserTier,
+  getPersonalizedMomentTip,
+  getTimeSlice,
+} from '@/lib/wellness-personalized-plans';
 
 // ============================================================================
 // Types
@@ -44,6 +50,9 @@ interface MentalHealthRisk {
 interface TimeContext {
   period: 'morning' | 'afternoon' | 'evening' | 'night';
   hour: number;
+  minute: number;
+  /** ช่วงกลางคืนแยกย่อย: หลัง 21:00 vs หลังเที่ยงคืน–ตี 5 */
+  nightPhase: 'none' | 'late_evening' | 'after_midnight';
   thaiPeriod: string;
   insight: string;
   typicalPattern: string;
@@ -101,10 +110,15 @@ function getTimeContext(timestamp: number): TimeContext {
   const minutes = date.getMinutes();
   const timeStr = `${hour.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')} น.`;
 
+  const slice = getTimeSlice(timestamp);
+  const nightPhase = slice.nightPhase;
+
   if (hour >= 5 && hour < 12) {
     return {
       period: 'morning',
       hour,
+      minute: minutes,
+      nightPhase: 'none',
       thaiPeriod: `ช่วงเช้า (${timeStr})`,
       insight: hour < 9
         ? 'คุณตื่นเช็คอินแต่เช้า แสดงว่าใส่ใจสุขภาพของตัวเองดี!'
@@ -118,6 +132,8 @@ function getTimeContext(timestamp: number): TimeContext {
     return {
       period: 'afternoon',
       hour,
+      minute: minutes,
+      nightPhase: 'none',
       thaiPeriod: `ช่วงบ่าย (${timeStr})`,
       insight: hour < 14
         ? 'หลังมื้อเที่ยง ร่างกายอาจรู้สึกง่วงเล็กน้อย เป็นเรื่องปกติ'
@@ -131,23 +147,37 @@ function getTimeContext(timestamp: number): TimeContext {
     return {
       period: 'evening',
       hour,
+      minute: minutes,
+      nightPhase: 'none',
       thaiPeriod: `ช่วงเย็น (${timeStr})`,
       insight: 'หลังเลิกงาน เป็นช่วงที่ความเครียดสะสมมักแสดงออกมา ผลการวิเคราะห์อาจสะท้อนความเหนื่อยล้าของทั้งวัน',
       typicalPattern: 'ช่วงเย็นเป็นเวลาที่ร่างกายเริ่มผ่อนคลาย Cortisol ลดลง อาจรู้สึกเหนื่อยแต่ก็เป็นโอกาสดีในการทบทวนอารมณ์ของวัน',
       recommendation: 'ลองทำกิจกรรมผ่อนคลายก่อนนอน เช่น อ่านหนังสือ ฟังเพลงเบาๆ หรือพูดคุยกับครอบครัว',
     };
   } else {
+    const isAfterMidnight = nightPhase === 'after_midnight';
+    const thaiLabel = isAfterMidnight
+      ? `ช่วงดึกหลังเที่ยงคืน (${timeStr})`
+      : `ช่วงกลางคืน (${timeStr})`;
     return {
       period: 'night',
       hour,
-      thaiPeriod: `ช่วงกลางคืน (${timeStr})`,
-      insight: hour < 23
-        ? 'การเช็คอินก่อนนอนเป็นนิสัยที่ดี ช่วยทบทวนอารมณ์ของวัน'
-        : 'ดึกแล้วนะ การนอนดึกอาจส่งผลต่อสุขภาวะอารมณ์ของวันพรุ่งนี้',
-      typicalPattern: 'ช่วงกลางคืน ร่างกายผลิต Melatonin เพื่อเตรียมพร้อมสำหรับการนอน หน้าจอสีฟ้าอาจรบกวนการผลิตฮอร์โมนนี้',
-      recommendation: hour < 23
-        ? 'เตรียมตัวนอนได้เลย ลดแสงหน้าจอและทำห้องให้มืดและเย็น'
-        : 'พยายามเข้านอนเร็วกว่านี้คืนพรุ่งนี้ การนอนหลับเพียงพอสำคัญมากต่อสุขภาพจิต',
+      minute: minutes,
+      nightPhase,
+      thaiPeriod: thaiLabel,
+      insight: isAfterMidnight
+        ? 'หลังเที่ยงคืนแล้ว — ร่างกายควรได้พักฟื้น ถ้าคุณยังใช้กล้อง/หน้าจออยู่ ลองลดแสงและเตรียมพักผ่อน ผลการประเมินอาจสะท้อนความเหนื่อยล้าสะสมมากกว่าตอนกลางวัน'
+        : hour < 23
+          ? 'การเช็คอินก่อนนอนเป็นนิสัยที่ดี ช่วยทบทวนอารมณ์ของวัน'
+          : 'ดึกแล้วนะ การนอนดึกอาจส่งผลต่อสุขภาวะอารมณ์ของวันพรุ่งนี้',
+      typicalPattern: isAfterMidnight
+        ? 'ช่วงตี 1–5 น. เป็นช่วงที่ควรนอนหลับลึก การจ้องหน้าจอหรือนอนดึกส่งผลต่ออารมณ์และการฟื้นตัวของสมองในวันถัดไป'
+        : 'ช่วงกลางคืน ร่างกายผลิต Melatonin เพื่อเตรียมพร้อมสำหรับการนอน หน้าจอสีฟ้าอาจรบกวนการผลิตฮอร์โมนนี้',
+      recommendation: isAfterMidnight
+        ? 'แนะนำให้หยุดงานหนักและหน้าจอ ลดแสง ดื่มน้ำอุ่น และพยายามนอนเร็วที่สุดเท่าที่ทำได้'
+        : hour < 23
+          ? 'เตรียมตัวนอนได้เลย ลดแสงหน้าจอและทำห้องให้มืดและเย็น'
+          : 'พยายามเข้านอนเร็วกว่านี้คืนพรุ่งนี้ การนอนหลับเพียงพอสำคัญมากต่อสุขภาพจิต',
     };
   }
 }
@@ -645,91 +675,6 @@ function generateFacialInsights(prediction: PHQ9Prediction, checkin?: CheckinRes
   return insights.slice(0, 4);
 }
 
-// ============================================================================
-// Recommendations Functions
-// ============================================================================
-
-function generateTimeBasedRecommendations(
-  prediction: PHQ9Prediction,
-  wellness: WellnessScore,
-  timeContext: TimeContext,
-  checkin?: CheckinResponse
-): { immediate: string[]; today: string[]; thisWeek: string[] } {
-  const immediate: string[] = [];
-  const today: string[] = [];
-  const thisWeek: string[] = [];
-  const pushUnique = (list: string[], value?: string) => {
-    if (!value) return;
-    if (!list.includes(value)) list.push(value);
-  };
-
-  // Model-driven recommendations first (reflects actual prediction)
-  const modelRecs = prediction.recommendations || [];
-  pushUnique(immediate, modelRecs[0]);
-  if (prediction.score >= 10) {
-    pushUnique(immediate, modelRecs[1]);
-  } else {
-    pushUnique(today, modelRecs[1]);
-  }
-
-  // Time-specific immediate actions
-  if (timeContext.period === 'morning') {
-    if (wellness.energy < 50) {
-      pushUnique(immediate, 'ดื่มน้ำ 1 แก้วและออกไปรับแสงแดดยามเช้า 5 นาที');
-    } else {
-      pushUnique(immediate, 'เช้านี้พลังงานดี ลองวางแผนทำสิ่งสำคัญที่สุดของวันตอนนี้');
-    }
-  } else if (timeContext.period === 'afternoon') {
-    if (wellness.fatigue > 50) {
-      pushUnique(immediate, 'ช่วงบ่ายง่วงเป็นธรรมชาติ ลองเดินเล่น 5 นาทีหรืองีบสั้นๆ');
-    }
-    pushUnique(immediate, 'ดื่มน้ำและกินของว่างที่มีโปรตีนเพื่อเพิ่มพลังงาน');
-  } else if (timeContext.period === 'evening') {
-    pushUnique(immediate, 'ช่วงเย็นแล้ว ลองทำกิจกรรมผ่อนคลายที่ชอบสักอย่าง');
-    if (wellness.stress > 50) {
-      pushUnique(immediate, 'หายใจลึกๆ 3 ครั้ง ปล่อยความเครียดของวันออกไป');
-    }
-  } else {
-    pushUnique(immediate, 'ดึกแล้ว ลดแสงหน้าจอและเตรียมตัวนอน');
-    pushUnique(immediate, 'ลองทำ stretching เบาๆ หรือฟังเพลงผ่อนคลายก่อนนอน');
-  }
-
-  // Stress-based recommendations
-  if (wellness.stress > 60) {
-    pushUnique(immediate, 'หายใจลึก 3 ครั้ง - สูดเข้า 4 วินาที กลั้น 4 วินาที ปล่อยออก 6 วินาที');
-    pushUnique(today, 'จัดเวลาพัก 15 นาทีทำสิ่งที่ผ่อนคลาย');
-  }
-
-  // Today recommendations based on time
-  if (timeContext.period === 'morning' || timeContext.period === 'afternoon') {
-    if (wellness.energy < 60) {
-      pushUnique(today, 'พยายามออกไปเดินกลางแจ้งอย่างน้อย 15 นาทีวันนี้');
-    }
-    pushUnique(today, 'กำหนดเวลาเลิกงานที่ชัดเจน ไม่ทำงานเลยเวลา');
-  } else {
-    pushUnique(today, 'คืนนี้นอนให้เร็วกว่าปกติ 30 นาที');
-    if (checkin && checkin.sleepQuality <= 3) {
-      pushUnique(today, 'ปิดหน้าจอทุกชนิดก่อนนอน 1 ชั่วโมง');
-    }
-  }
-
-  // This week recommendations
-  pushUnique(thisWeek, 'ตั้งเป้าเช็คอินสุขภาวะอารมณ์ทุกวันเพื่อติดตามแนวโน้ม');
-  if (wellness.fatigue > 50 || (checkin && checkin.sleepQuality <= 3)) {
-    pushUnique(thisWeek, 'ปรับปรุงการนอน: ห้องมืด เย็น นอนเวลาเดิมทุกวัน');
-  }
-  pushUnique(thisWeek, 'ออกกำลังกายเบาๆ อย่างน้อย 3 ครั้ง ครั้งละ 20 นาที');
-  if (wellness.stress > 50) {
-    pushUnique(thisWeek, 'ลองฝึก meditation หรือ mindfulness 10 นาที/วัน');
-  }
-
-  return {
-    immediate: immediate.slice(0, 2),
-    today: today.slice(0, 3),
-    thisWeek: thisWeek.slice(0, 3),
-  };
-}
-
 function getNextCheckinSuggestion(risks: MentalHealthRisk[], timestamp: number) {
   const priority = { high: 0, elevated: 1, moderate: 2, low: 3 };
   const highest = [...risks].sort((a, b) => priority[a.risk] - priority[b.risk])[0];
@@ -923,9 +868,45 @@ export default function WellnessResult({
     [prediction, checkinResponse]
   );
 
+  const recommendationSeed = useMemo(
+    () =>
+      Math.abs(
+        Math.floor(currentTimestamp / 60000) +
+          prediction.score * 31 +
+          wellness.stress * 17 +
+          wellness.fatigue * 13
+      ),
+    [currentTimestamp, prediction.score, wellness.stress, wellness.fatigue]
+  );
+
+  const personalizedMomentTip = useMemo(
+    () =>
+      getPersonalizedMomentTip(
+        getTimeSlice(currentTimestamp),
+        deriveUserTier(prediction, wellness),
+        wellness,
+        recommendationSeed
+      ),
+    [currentTimestamp, prediction, wellness, recommendationSeed]
+  );
+
   const recommendations = useMemo(
-    () => generateTimeBasedRecommendations(prediction, wellness, timeContext, checkinResponse),
-    [prediction, wellness, timeContext, checkinResponse]
+    () =>
+      buildPersonalizedRecommendations({
+        prediction,
+        wellness,
+        slice: getTimeSlice(currentTimestamp),
+        checkin: checkinResponse
+          ? {
+              sleepQuality: checkinResponse.sleepQuality,
+              stressLevel: checkinResponse.stressLevel,
+              energyLevel: checkinResponse.energyLevel,
+            }
+          : undefined,
+        scanTimestamp: currentTimestamp,
+        modelRecs: prediction.recommendations || [],
+      }),
+    [prediction, wellness, currentTimestamp, checkinResponse]
   );
 
   const nextCheckin = useMemo(
@@ -1179,7 +1160,7 @@ export default function WellnessResult({
         <p className="text-sm text-cyan-700 mb-3">{timeContext.typicalPattern}</p>
         <div className="bg-white/60 rounded-lg p-3">
           <p className="text-sm text-cyan-800">
-            <strong>💡 คำแนะนำสำหรับช่วงนี้:</strong> {timeContext.recommendation}
+            <strong>💡 คำแนะนำสำหรับช่วงนี้:</strong> {personalizedMomentTip}
           </p>
         </div>
       </div>

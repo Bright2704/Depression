@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "auOnnxAvailable": false,
+  "message": "ยังไม่มีไฟล์โมเดลใน models/ — วาง au.onnx และ facepsy.manifest.json แล้วรัน npm run copy-models"
+}

@@ -393,3 +393,70 @@ Landing → Consent → Quick check-in → Face scan → Result → Save history
 นี่คือ flow ที่สมดุลระหว่าง
 ความง่าย, ความน่าเชื่อถือ, และการทำเงิน
 
+You are an expert full-stack AI developer specializing in privacy-first affective computing, real-time facial analysis, and mental wellness web applications.
+Project Goal
+I am building a web application called [Your App Name].
+The core feature is:
+
+User opens the webcam (browser only).
+The system scans the face once (or continuously in short bursts).
+It extracts only vector features (never stores raw images).
+It analyzes mood / depression tendency and gives personalized recommendations.
+It tracks changes over days / weeks / months (Mood Score, trends, graph).
+The system must be privacy-first: everything runs client-side as much as possible.
+
+Technical Requirements (Must Follow Exactly)
+
+Face Landmark Extraction: Use Google MediaPipe Face Landmarker (latest version, WebAssembly / TensorFlow.js or ONNX Runtime Web) to get 468–478 landmarks + blendshapes (smile probability, eye open probability, brow, etc.) + head pose + EAR (Eye Aspect Ratio) + IVA (Inter-Vector Angles).
+Action Unit (AU) Detection: Integrate the AU CNN model from FacePsy (open-source project from Stevens Institute of Technology, GitHub: https://github.com/stevenshci/FacePsy).
+Extract AU intensities for at least AU2, AU6, AU7, AU12, AU15, AU17 (the most important ones for depression according to the paper).
+Run the AU model on the landmarks from MediaPipe (hybrid pipeline).
+
+Feature Engineering (exactly like FacePsy paper):
+For each scan session: calculate statistical features (min, max, mean, median, std, q1, q3, sum).
+Segment by time-of-day epochs: midnight, morning, afternoon, evening.
+Final feature vector ≈ 300–1280 dimensions (landmarks + 12 AUs + blendshapes + EAR/IVA + head pose + statistics).
+
+Model Architecture:
+Universal model (pre-trained on public + FacePsy data) for first-time users.
+Hybrid model (universal + small amount of user-specific data) after 7–14 days.
+Use LightGBM or small Neural Net (ONNX format).
+Output: binary (depressive / non-depressive episode) + regression (predicted PHQ-9 score 0–27) + confidence score.
+
+Calibration & Accuracy:
+Use Platt Scaling or Isotonic Regression.
+Show results as “Mood Score 0–100” + “Depression risk: Low / Moderate / High” with explanation.
+Support continual learning: every time user does PHQ-9, use the new vector + label to fine-tune the user-specific model.
+
+Privacy & Data Handling:
+NEVER store or send raw images to server.
+Store only anonymized vectors (512–1024 dim) in IndexedDB or encrypted Supabase/Firebase.
+User can delete all their data anytime (Right to be Forgotten).
+Clear disclaimer: “This is a screening tool only, not a medical diagnosis.”
+
+User Flow & Monetization:
+Freemium: 1 free scan per day + basic score.
+Premium (149–199 THB/month): unlimited scans, full 30-day history graph, detailed reports, export PDF.
+Track weekly / monthly trends.
+
+
+Dataset Collection Strategy (Very Important)
+
+When a user finishes a scan, automatically save the final feature vector + timestamp + time-of-day.
+After every 7–14 days, ask the user to fill a short PHQ-9 questionnaire (ground truth).
+Store the pair (vector + PHQ-9 label) in a secure folder on the server named /user_data/[user_id]/ (or Supabase bucket).
+Use this data for continual learning / fine-tuning the hybrid model automatically (run training job weekly).
+Start with 50–100 users to reach good accuracy quickly.
+
+What I Need You to Output
+
+Complete step-by-step development plan (MVP in 2 weeks).
+Folder structure of the project.
+Sample JavaScript code for MediaPipe + AU model hybrid pipeline (client-side).
+How to export / convert FacePsy AU CNN model to ONNX Runtime Web.
+Backend code (Node.js / Supabase) for storing vectors and triggering training.
+Prompt for continual learning script.
+UI/UX wireframe description + disclaimer text.
+Any missing pieces I still need to prepare (dataset, API keys, etc.).
+
+Be extremely precise, production-ready, and privacy-focused. Use modern best practices 2026.

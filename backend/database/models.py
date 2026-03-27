@@ -134,3 +134,44 @@ class AdminActivityLog(Base):
     user_agent = Column(String(500), nullable=True)
 
     created_at = Column(DateTime, server_default=func.now())
+
+
+class UserWellnessOptIn(Base):
+    __tablename__ = "user_wellness_opt_in"
+
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    share_vectors = Column(Boolean, default=False)
+    share_phq9 = Column(Boolean, default=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class WellnessVectorSample(Base):
+    __tablename__ = "wellness_vector_samples"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    dim = Column(Integer, nullable=False)
+    time_epoch = Column(String(32), nullable=True)
+    session_id = Column(String(36), nullable=True)
+    vector_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class WellnessPhq9Label(Base):
+    __tablename__ = "wellness_phq9_labels"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    total_score = Column(Integer, nullable=False)
+    answers_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class WellnessTrainingJob(Base):
+    __tablename__ = "wellness_training_jobs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    status = Column(String(32), nullable=False)
+    payload_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    finished_at = Column(DateTime, nullable=True)

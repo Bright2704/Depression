@@ -5,6 +5,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "inventory-models": "node scripts/inventory-models.mjs",
+    "copy-models": "node scripts/copy-facepsy-models.mjs",
+    "prebuild": "npm run inventory-models && npm run copy-models",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
@@ -13,6 +16,8 @@
   "dependencies": {
     "@mediapipe/camera_utils": "^0.3.1675466862",
     "@mediapipe/face_mesh": "^0.4.1633559619",
+    "@mediapipe/tasks-vision": "^0.10.8",
+    "onnxruntime-web": "^1.17.3",
     "next": "14.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

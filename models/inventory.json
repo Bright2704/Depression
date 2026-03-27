@@ -1,0 +1,35 @@
+{
+  "generatedAt": "2026-03-27T21:21:58.770Z",
+  "modelsRoot": "models/",
+  "summary": {
+    "fileCount": 3,
+    "extensions": [
+      ".json",
+      ".task",
+      ".tflite"
+    ],
+    "hasOnnx": false,
+    "manifestJson": null
+  },
+  "inputShapeHint": "ดูที่ models/facepsy.manifest.json (หรือ .example) ฟิลด์ auOnnx.inputShape",
+  "files": [
+    {
+      "relativePath": "AU_200.tflite",
+      "extension": ".tflite",
+      "sizeBytes": 19084292,
+      "mtimeMs": 1774645434145.125
+    },
+    {
+      "relativePath": "facepsy.manifest.example.json",
+      "extension": ".json",
+      "sizeBytes": 508,
+      "mtimeMs": 1774645883387.1494
+    },
+    {
+      "relativePath": "face_landmarker.task",
+      "extension": ".task",
+      "sizeBytes": 3758596,
+      "mtimeMs": 1774645434164.228
+    }
+  ]
+}

@@ -24,6 +24,7 @@ from .admin.router import router as admin_router
 from .users.router import router as users_router
 from .scans.router import router as scans_router
 from .payments.router import router as payments_router
+from .wellness.router import router as wellness_router
 from .config import settings
 
 # Try to import tflite (optional - AU detection will be disabled if not available)
@@ -62,6 +63,7 @@ app.include_router(admin_router)
 app.include_router(users_router)
 app.include_router(scans_router)
 app.include_router(payments_router)
+app.include_router(wellness_router)
 
 # Model paths
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
